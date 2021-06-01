@@ -45,7 +45,7 @@
 
 # simple create table with table qualifier that does not exists
 "create table a.b(id int)"
-"no keyspace with name [a] found"
+"Unknown database 'a' in vschema"
 
 #Alter table
 "alter table a ADD id int"
@@ -94,15 +94,25 @@
 
 #Alter table with unknown qualifier
 "alter table a.b ADD id int"
-"keyspace a not found in vschema"
+"Unknown database 'a' in vschema"
 
 # create db foo
 "create database foo"
-"create database not allowed"
+{
+  "QueryType": "DDL",
+  "Original": "create database foo",
+  "Instructions": {
+    "OperatorType": "CREATEDB",
+    "Keyspace": {
+      "Name": "foo",
+      "Sharded": false
+    }
+  }
+}
 
 # create db main
 "create database main"
-"Can't create database 'main'; database exists (errno 1007) (sqlstate HY000)"
+"Can't create database 'main'; database exists"
 
 # create db if not exists main
 "create database if not exists main"
@@ -116,23 +126,43 @@
 
 # alter db foo
 "alter database foo collate utf8"
-"Can't alter database 'foo'; database doesn't exists"
+"Can't alter database 'foo'; unknown database"
 
 # alter db main
 "alter database main collate utf8"
-"alter database not allowed"
+"alter database is not supported"
 
 # drop db foo
 "drop database foo"
-"Can't drop database 'foo'; database doesn't exists (errno 1008) (sqlstate HY000)"
+"Can't drop database 'foo'; database doesn't exists"
 
 # drop db main
 "drop database main"
-"drop database not allowed"
+{
+  "QueryType": "DDL",
+  "Original": "drop database main",
+  "Instructions": {
+    "OperatorType": "DROPDB",
+    "Keyspace": {
+      "Name": "main",
+      "Sharded": false
+    }
+  }
+}
 
 # drop db if exists main
 "drop database if exists main"
-"drop database not allowed"
+{
+  "QueryType": "DDL",
+  "Original": "drop database if exists main",
+  "Instructions": {
+    "OperatorType": "DROPDB",
+    "Keyspace": {
+      "Name": "main",
+      "Sharded": false
+    }
+  }
+}
 
 # drop db if exists foo
 "drop schema if exists foo"

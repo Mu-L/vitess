@@ -23,6 +23,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"vitess.io/vitess/go/mysql"
+
 	"vitess.io/vitess/go/test/utils"
 
 	"github.com/stretchr/testify/require"
@@ -132,7 +134,7 @@ func TestUpdateEqual(t *testing.T) {
 			BindVariables: map[string]*querypb.BindVariable{
 				"lastname":    sqltypes.ValueBindVariable(sqltypes.NewVarChar("foo")),
 				"name":        sqltypes.Int32BindVariable(1),
-				"keyspace_id": sqltypes.BytesBindVariable([]byte("\026k@\264J\272K\326")),
+				"keyspace_id": sqltypes.BytesBindVariable([]byte("\x16k@\xb4J\xbaK\xd6")),
 			},
 		},
 		{
@@ -140,7 +142,7 @@ func TestUpdateEqual(t *testing.T) {
 			BindVariables: map[string]*querypb.BindVariable{
 				"name_0":        sqltypes.BytesBindVariable([]byte("myname")),
 				"lastname_0":    sqltypes.BytesBindVariable([]byte("mylastname")),
-				"keyspace_id_0": sqltypes.BytesBindVariable([]byte("\026k@\264J\272K\326")),
+				"keyspace_id_0": sqltypes.BytesBindVariable([]byte("\x16k@\xb4J\xbaK\xd6")),
 			},
 		},
 	}
@@ -447,7 +449,7 @@ func TestDeleteEqual(t *testing.T) {
 			BindVariables: map[string]*querypb.BindVariable{
 				"lastname":    sqltypes.ValueBindVariable(sqltypes.NewVarChar("foo")),
 				"name":        sqltypes.Int32BindVariable(1),
-				"keyspace_id": sqltypes.BytesBindVariable([]byte("\026k@\264J\272K\326")),
+				"keyspace_id": sqltypes.BytesBindVariable([]byte("\x16k@\xb4J\xbaK\xd6")),
 			},
 		},
 	}
@@ -635,10 +637,7 @@ func TestInsertShardedKeyrange(t *testing.T) {
 
 	// If a unique vindex returns a keyrange, we fail the insert
 	_, err := executorExec(executor, "insert into keyrange_table(krcol_unique, krcol) values(1, 1)", nil)
-	want := "execInsertSharded: getInsertShardedRoute: could not map [INT64(1)] to a unique keyspace id: DestinationKeyRange(-10)"
-	if err == nil || err.Error() != want {
-		t.Errorf("executorExec error: %v, want %s", err, want)
-	}
+	require.EqualError(t, err, "could not map [INT64(1)] to a unique keyspace id: DestinationKeyRange(-10)")
 }
 
 func TestInsertShardedAutocommitLookup(t *testing.T) {
@@ -1241,10 +1240,7 @@ func TestInsertPartialFail1(t *testing.T) {
 		"insert into user(id, v, name) values (1, 2, 'myname')",
 		nil,
 	)
-	want := "execInsertSharded:"
-	if err == nil || !strings.HasPrefix(err.Error(), want) {
-		t.Errorf("insert first DML fail: %v, must start with %s", err, want)
-	}
+	require.Error(t, err)
 }
 
 // If a statement gets broken up into two, and the second one fails
@@ -1379,10 +1375,10 @@ func TestMultiInsertSharded(t *testing.T) {
 		BindVariables: map[string]*querypb.BindVariable{
 			"name_0":        sqltypes.BytesBindVariable([]byte("myname")),
 			"lastname_0":    sqltypes.BytesBindVariable([]byte("mylastname")),
-			"keyspace_id_0": sqltypes.BytesBindVariable([]byte("\006\347\352\"\316\222p\217")),
+			"keyspace_id_0": sqltypes.BytesBindVariable([]byte("\x06\xe7\xea\"Βp\x8f")),
 			"name_1":        sqltypes.BytesBindVariable([]byte("myname2")),
 			"lastname_1":    sqltypes.BytesBindVariable([]byte("mylastname2")),
-			"keyspace_id_1": sqltypes.BytesBindVariable([]byte("N\261\220\311\242\372\026\234")),
+			"keyspace_id_1": sqltypes.BytesBindVariable([]byte("N\xb1\x90ɢ\xfa\x16\x9c")),
 		},
 	}}
 	if !reflect.DeepEqual(sbclookup.Queries, wantQueries) {
@@ -1609,7 +1605,7 @@ func TestKeyDestRangeQuery(t *testing.T) {
 	masterSession.TargetString = "TestExecutor[-]"
 	_, err := executorExec(executor, insertInput, nil)
 
-	require.EqualError(t, err, "range queries not supported for inserts: TestExecutor[-]")
+	require.EqualError(t, err, "INSERT not supported when targeting a key range: TestExecutor[-]")
 
 	masterSession.TargetString = ""
 }
@@ -1736,4 +1732,55 @@ func TestDeleteLookupOwnedEqual(t *testing.T) {
 	}}
 	utils.MustMatch(t, sbc1.Queries, sbc1wantQueries, "")
 	utils.MustMatch(t, sbc2.Queries, sbc2wantQueries, "")
+}
+
+func TestReservedConnDML(t *testing.T) {
+	executor, _, _, sbc := createExecutorEnv()
+
+	logChan := QueryLogger.Subscribe("TestReservedConnDML")
+	defer QueryLogger.Unsubscribe(logChan)
+
+	ctx := context.Background()
+	session := NewAutocommitSession(&vtgatepb.Session{EnableSystemSettings: true})
+
+	_, err := executor.Execute(ctx, "TestReservedConnDML", session, "use "+KsTestUnsharded, nil)
+	require.NoError(t, err)
+
+	wantQueries := []*querypb.BoundQuery{
+		{Sql: "select 1 from dual where @@default_week_format != 1", BindVariables: map[string]*querypb.BindVariable{}},
+	}
+	sbc.SetResults([]*sqltypes.Result{
+		sqltypes.MakeTestResult(sqltypes.MakeTestFields("id", "int64"), "1"),
+	})
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "set default_week_format = 1", nil)
+	require.NoError(t, err)
+	utils.MustMatch(t, wantQueries, sbc.Queries)
+
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "begin", nil)
+	require.NoError(t, err)
+
+	wantQueries = append(wantQueries,
+		&querypb.BoundQuery{Sql: "set @@default_week_format = 1", BindVariables: map[string]*querypb.BindVariable{}},
+		&querypb.BoundQuery{Sql: "insert into simple values ()", BindVariables: map[string]*querypb.BindVariable{}})
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "insert into simple() values ()", nil)
+	require.NoError(t, err)
+	utils.MustMatch(t, wantQueries, sbc.Queries)
+
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "commit", nil)
+	require.NoError(t, err)
+
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "begin", nil)
+	require.NoError(t, err)
+
+	sbc.EphemeralShardErr = mysql.NewSQLError(mysql.CRServerGone, mysql.SSNetError, "connection gone")
+	// as the first time the query fails due to connection loss i.e. reserved conn lost. It will be recreated to set statement will be executed again.
+	wantQueries = append(wantQueries,
+		&querypb.BoundQuery{Sql: "set @@default_week_format = 1", BindVariables: map[string]*querypb.BindVariable{}},
+		&querypb.BoundQuery{Sql: "insert into simple values ()", BindVariables: map[string]*querypb.BindVariable{}})
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "insert into simple() values ()", nil)
+	require.NoError(t, err)
+	utils.MustMatch(t, wantQueries, sbc.Queries)
+
+	_, err = executor.Execute(ctx, "TestReservedConnDML", session, "commit", nil)
+	require.NoError(t, err)
 }

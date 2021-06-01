@@ -241,6 +241,12 @@ func TestIsOnlineSchemaDDL(t *testing.T) {
 		},
 		{
 			query:       "ALTER TABLE t ADD COLUMN i INT",
+			ddlStrategy: "online",
+			isOnlineDDL: true,
+			strategy:    schema.DDLStrategyOnline,
+		},
+		{
+			query:       "ALTER TABLE t ADD COLUMN i INT",
 			ddlStrategy: "",
 			isOnlineDDL: false,
 		},
@@ -256,6 +262,11 @@ func TestIsOnlineSchemaDDL(t *testing.T) {
 			isOnlineDDL: true,
 			strategy:    schema.DDLStrategyGhost,
 			options:     "--max-load=Threads_running=100",
+		},
+		{
+			query:       "TRUNCATE TABLE t",
+			ddlStrategy: "online",
+			isOnlineDDL: false,
 		},
 		{
 			query:       "TRUNCATE TABLE t",
@@ -280,11 +291,11 @@ func TestIsOnlineSchemaDDL(t *testing.T) {
 		ddlStmt, ok := stmt.(sqlparser.DDLStatement)
 		assert.True(t, ok)
 
-		isOnlineDDL, strategy, options := e.isOnlineSchemaDDL(ddlStmt)
+		isOnlineDDL := e.isOnlineSchemaDDL(ddlStmt)
 		assert.Equal(t, ts.isOnlineDDL, isOnlineDDL)
 		if isOnlineDDL {
-			assert.Equal(t, ts.strategy, strategy)
-			assert.Equal(t, ts.options, options)
+			assert.Equal(t, ts.strategy, e.ddlStrategySetting.Strategy)
+			assert.Equal(t, ts.options, e.ddlStrategySetting.Options)
 		}
 	}
 }

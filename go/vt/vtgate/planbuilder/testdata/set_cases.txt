@@ -99,7 +99,6 @@ Gen4 plan same as above
           "Sharded": false
         },
         "TargetDestination": "AnyShard()",
-        "IsDML": false,
         "Query": "select CONCAT('Any', 'Expression', 'Is', 'Valid') from dual",
         "SingleShardOnly": true
       }
@@ -521,4 +520,9 @@ Gen4 plan same as above
     ]
   }
 }
+Gen4 plan same as above
+
+# change read only variable
+"set socket = ''"
+"variable 'socket' is a read only variable"
 Gen4 plan same as above

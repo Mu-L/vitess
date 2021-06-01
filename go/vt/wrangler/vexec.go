@@ -24,25 +24,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/concurrency"
-	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo"
+	vtctldvexec "vitess.io/vitess/go/vt/vtctl/workflow/vexec" // renamed to avoid a collision with the vexec struct in this package
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
 
 const (
-	vexecTableQualifier       = "_vt"
-	vreplicationTableName     = "vreplication"
-	schemaMigrationsTableName = "schema_migrations"
+	vexecTableQualifier   = "_vt"
+	vreplicationTableName = "vreplication"
 )
 
 // vexec is the construct by which we run a query against backend shards. vexec is created by user-facing
@@ -204,9 +207,7 @@ func (vx *vexec) exec() (map[*topo.TabletInfo]*querypb.QueryResult, error) {
 		wg.Add(1)
 		go func(ctx context.Context, master *topo.TabletInfo) {
 			defer wg.Done()
-			log.Infof("Running %s on %s\n", vx.plannedQuery, master.AliasString())
 			qr, err := vx.planner.exec(ctx, master.Alias, vx.plannedQuery)
-			log.Infof("Result is %s: %v", master.AliasString(), qr)
 			if err != nil {
 				allErrors.RecordError(err)
 			} else {
@@ -369,7 +370,7 @@ type ReplicationStatus struct {
 	// ID represents the id column from the _vt.vreplication table.
 	ID int64
 	// Bls represents the BinlogSource.
-	Bls binlogdatapb.BinlogSource
+	Bls *binlogdatapb.BinlogSource
 	// Pos represents the pos column from the _vt.vreplication table.
 	Pos string
 	// StopPos represents the stop_pos column from the _vt.vreplication table.
@@ -394,14 +395,25 @@ func (wr *Wrangler) getReplicationStatusFromRow(ctx context.Context, row []sqlty
 	var id, timeUpdated, transactionTimestamp int64
 	var state, dbName, pos, stopPos, message string
 	var bls binlogdatapb.BinlogSource
+	var mpos mysql.Position
+
 	id, err = evalengine.ToInt64(row[0])
 	if err != nil {
 		return nil, "", err
 	}
-	if err := proto.UnmarshalText(row[1].ToString(), &bls); err != nil {
+	if err := prototext.Unmarshal(row[1].ToBytes(), &bls); err != nil {
 		return nil, "", err
 	}
+
+	// gtid in the pos column can be compressed, so check and possibly uncompress
 	pos = row[2].ToString()
+	if pos != "" {
+		mpos, err = binlogplayer.DecodePosition(pos)
+		if err != nil {
+			return nil, "", err
+		}
+		pos = mpos.String()
+	}
 	stopPos = row[3].ToString()
 	state = row[5].ToString()
 	dbName = row[6].ToString()
@@ -418,7 +430,7 @@ func (wr *Wrangler) getReplicationStatusFromRow(ctx context.Context, row []sqlty
 		Shard:                master.Shard,
 		Tablet:               master.AliasString(),
 		ID:                   id,
-		Bls:                  bls,
+		Bls:                  &bls,
 		Pos:                  pos,
 		StopPos:              stopPos,
 		State:                state,
@@ -509,7 +521,8 @@ func (wr *Wrangler) ListAllWorkflows(ctx context.Context, keyspace string, activ
 		where = " where state <> 'Stopped'"
 	}
 	query := "select distinct workflow from _vt.vreplication" + where
-	results, err := wr.runVexec(ctx, "", keyspace, query, false)
+	vx := vtctldvexec.NewVExec(keyspace, "", wr.ts, wr.tmc)
+	results, err := vx.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}

@@ -301,13 +301,16 @@ func TestQueryExecutorPlans(t *testing.T) {
 			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, tcase.input)
 			assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
 
+			// Wait for the existing query to be processed by the cache
+			tsv.QueryPlanCacheWait()
+
 			// Test inside a transaction.
 			target := tsv.sm.Target()
-			txid, alias, err := tsv.Begin(ctx, &target, nil)
+			txid, alias, err := tsv.Begin(ctx, target, nil)
 			require.NoError(t, err)
 			require.NotNil(t, alias, "alias should not be nil")
-			assert.Equal(t, tsv.alias, *alias, "Wrong alias returned by Begin")
-			defer tsv.Commit(ctx, &target, txid)
+			assert.Equal(t, tsv.alias, alias, "Wrong alias returned by Begin")
+			defer tsv.Commit(ctx, target, txid)
 
 			qre = newTestQueryExecutor(ctx, tsv, tcase.input, txid)
 			got, err = qre.Execute()
@@ -370,11 +373,11 @@ func TestQueryExecutorSelectImpossible(t *testing.T) {
 			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, tcase.input)
 			assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
 			target := tsv.sm.Target()
-			txid, alias, err := tsv.Begin(ctx, &target, nil)
+			txid, alias, err := tsv.Begin(ctx, target, nil)
 			require.NoError(t, err)
 			require.NotNil(t, alias, "alias should not be nil")
-			assert.Equal(t, tsv.alias, *alias, "Wrong tablet alias from Begin")
-			defer tsv.Commit(ctx, &target, txid)
+			assert.Equal(t, tsv.alias, alias, "Wrong tablet alias from Begin")
+			defer tsv.Commit(ctx, target, txid)
 
 			qre = newTestQueryExecutor(ctx, tsv, tcase.input, txid)
 			got, err = qre.Execute()
@@ -478,11 +481,11 @@ func TestQueryExecutorLimitFailure(t *testing.T) {
 
 			// Test inside a transaction.
 			target := tsv.sm.Target()
-			txid, alias, err := tsv.Begin(ctx, &target, nil)
+			txid, alias, err := tsv.Begin(ctx, target, nil)
 			require.NoError(t, err)
 			require.NotNil(t, alias, "alias should not be nil")
-			assert.Equal(t, tsv.alias, *alias, "Wrong tablet alias from Begin")
-			defer tsv.Commit(ctx, &target, txid)
+			assert.Equal(t, tsv.alias, alias, "Wrong tablet alias from Begin")
+			defer tsv.Commit(ctx, target, txid)
 
 			qre = newTestQueryExecutor(ctx, tsv, tcase.input, txid)
 			_, err = qre.Execute()
@@ -524,12 +527,9 @@ func TestQueryExecutorPlanPassSelectWithLockOutsideATransaction(t *testing.T) {
 	tsv := newTestTabletServer(ctx, noFlags, db)
 	qre := newTestQueryExecutor(ctx, tsv, query, 0)
 	defer tsv.StopService()
-	assert.Equal(t, planbuilder.PlanSelectLock, qre.plan.PlanID)
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
 	_, err := qre.Execute()
-	if code := vterrors.Code(err); code != vtrpcpb.Code_FAILED_PRECONDITION {
-		assert.NoError(t, err)
-		t.Fatalf("qre.Execute: %v, want %v", code, vtrpcpb.Code_FAILED_PRECONDITION)
-	}
+	assert.NoError(t, err)
 }
 
 func TestQueryExecutorPlanNextval(t *testing.T) {
@@ -1147,10 +1147,14 @@ func newTestTabletServer(ctx context.Context, flags executorFlags, db *fakesqldb
 	if flags&smallResultSize > 0 {
 		config.Oltp.MaxRows = 2
 	}
-	tsv := NewTabletServer("TabletServerTest", config, memorytopo.NewServer(""), topodatapb.TabletAlias{})
 	dbconfigs := newDBConfigs(db)
-	target := querypb.Target{TabletType: topodatapb.TabletType_MASTER}
+	config.DB = dbconfigs
+	tsv := NewTabletServer("TabletServerTest", config, memorytopo.NewServer(""), &topodatapb.TabletAlias{})
+	target := &querypb.Target{TabletType: topodatapb.TabletType_MASTER}
 	err := tsv.StartService(target, dbconfigs, nil /* mysqld */)
+	if config.TwoPCEnable {
+		tsv.TwoPCEngineWait()
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -1159,7 +1163,7 @@ func newTestTabletServer(ctx context.Context, flags executorFlags, db *fakesqldb
 
 func newTransaction(tsv *TabletServer, options *querypb.ExecuteOptions) int64 {
 	target := tsv.sm.Target()
-	transactionID, _, err := tsv.Begin(context.Background(), &target, options)
+	transactionID, _, err := tsv.Begin(context.Background(), target, options)
 	if err != nil {
 		panic(vterrors.Wrap(err, "failed to start a transaction"))
 	}

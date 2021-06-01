@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+
 	"context"
 
 	"vitess.io/vitess/go/mysql"
@@ -462,7 +464,16 @@ func (tm *TabletManager) UndoDemoteMaster(ctx context.Context) error {
 	if err := tm.QueryServiceControl.SetServingType(tablet.Type, logutil.ProtoToTime(tablet.MasterTermStartTime), true, ""); err != nil {
 		return vterrors.Wrap(err, "SetServingType(serving=true) failed")
 	}
-
+	// Tell Orchestrator we're no longer stopped on purpose.
+	// Do this in the background, as it's best-effort.
+	go func() {
+		if tm.orc == nil {
+			return
+		}
+		if err := tm.orc.EndMaintenance(tm.Tablet()); err != nil {
+			log.Warningf("Orchestrator EndMaintenance failed: %v", err)
+		}
+	}()
 	return nil
 }
 
@@ -561,6 +572,10 @@ func (tm *TabletManager) setMasterLocked(ctx context.Context, parentAlias *topod
 	}
 	// Update the master address only if needed.
 	// We don't want to interrupt replication for no reason.
+	if parentAlias == nil {
+		// if there is no master in the shard, return an error so that we can retry
+		return vterrors.New(vtrpc.Code_FAILED_PRECONDITION, "Shard masterAlias is nil")
+	}
 	parent, err := tm.TopoServer.GetTablet(ctx, parentAlias)
 	if err != nil {
 		return err

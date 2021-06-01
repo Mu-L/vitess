@@ -126,7 +126,7 @@ func NewDiscoveryGateway(ctx context.Context, hc discovery.LegacyHealthCheck, se
 		}
 		var recorder discovery.LegacyTabletRecorder = dg.hc
 		if len(discovery.TabletFilters) > 0 {
-			if len(discovery.KeyspacesToWatch) > 0 {
+			if discovery.FilteringKeyspaces() {
 				log.Exitf("Only one of -keyspaces_to_watch and -tablet_filters may be specified at a time")
 			}
 
@@ -135,7 +135,7 @@ func NewDiscoveryGateway(ctx context.Context, hc discovery.LegacyHealthCheck, se
 				log.Exitf("Cannot parse tablet_filters parameter: %v", err)
 			}
 			recorder = fbs
-		} else if len(discovery.KeyspacesToWatch) > 0 {
+		} else if discovery.FilteringKeyspaces() {
 			recorder = discovery.NewLegacyFilterByKeyspace(recorder, discovery.KeyspacesToWatch)
 		}
 
@@ -240,7 +240,6 @@ func (dg *DiscoveryGateway) CacheStatus() TabletCacheStatusList {
 // a resharding event, and set the re-resolve bit and let the upper layers
 // re-resolve and retry.
 func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Target, unused queryservice.QueryService, name string, inTransaction bool, inner func(ctx context.Context, target *querypb.Target, conn queryservice.QueryService) (bool, error)) error {
-	var tabletLastUsed *topodatapb.Tablet
 	var err error
 	invalidTablets := make(map[string]bool)
 
@@ -288,7 +287,7 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		tablets := dg.tsc.GetHealthyTabletStats(target.Keyspace, target.Shard, target.TabletType)
 		if len(tablets) == 0 {
 			// fail fast if there is no tablet
-			err = vterrors.New(vtrpcpb.Code_UNAVAILABLE, "no valid tablet")
+			err = vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "no healthy tablet available for '%s'", target.String())
 			break
 		}
 		shuffleTablets(dg.localCell, tablets)
@@ -310,7 +309,6 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		}
 
 		// execute
-		tabletLastUsed = ts.Tablet
 		conn := dg.hc.GetConnection(ts.Key)
 		if conn == nil {
 			err = vterrors.Errorf(vtrpcpb.Code_UNAVAILABLE, "no connection for key %v tablet %+v", ts.Key, ts.Tablet)
@@ -328,7 +326,7 @@ func (dg *DiscoveryGateway) withRetry(ctx context.Context, target *querypb.Targe
 		}
 		break
 	}
-	return NewShardError(err, target, tabletLastUsed)
+	return NewShardError(err, target)
 }
 
 func shuffleTablets(cell string, tablets []discovery.LegacyTabletStats) {
@@ -407,6 +405,6 @@ func (dg *DiscoveryGateway) getStatsAggregator(target *querypb.Target) *TabletSt
 }
 
 // QueryServiceByAlias satisfies the Gateway interface
-func (dg *DiscoveryGateway) QueryServiceByAlias(_ *topodatapb.TabletAlias) (queryservice.QueryService, error) {
+func (dg *DiscoveryGateway) QueryServiceByAlias(_ *topodatapb.TabletAlias, _ *querypb.Target) (queryservice.QueryService, error) {
 	return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "DiscoveryGateway does not implement QueryServiceByAlias")
 }

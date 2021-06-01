@@ -63,6 +63,13 @@ func planFilter(pb *primitiveBuilder, input logicalPlan, filter sqlparser.Expr, 
 		}
 		node.UpdatePlan(pb, filter)
 		return node, nil
+	case *pulloutSubquery:
+		plan, err := planFilter(pb, node.underlying, filter, whereType, origin)
+		if err != nil {
+			return nil, err
+		}
+		node.underlying = plan
+		return node, nil
 	case *vindexFunc:
 		return filterVindexFunc(node, filter)
 	case *subquery:
@@ -71,7 +78,7 @@ func planFilter(pb *primitiveBuilder, input logicalPlan, filter sqlparser.Expr, 
 		return nil, errors.New("unsupported: filtering on results of aggregates")
 	}
 
-	return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "%T.filtering: unreachable", input)
+	return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "[BUG] unreachable %T.filtering", input)
 }
 
 func filterVindexFunc(node *vindexFunc, filter sqlparser.Expr) (logicalPlan, error) {

@@ -17,6 +17,8 @@ limitations under the License.
 package sqlparser
 
 import (
+	"strconv"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -32,10 +34,122 @@ type RewriteASTResult struct {
 	AST Statement // The rewritten AST
 }
 
+// ReservedVars keeps track of the bind variable names that have already been used
+// in a parsed query.
+type ReservedVars struct {
+	prefix       string
+	reserved     BindVars
+	next         []byte
+	counter      int
+	fast, static bool
+}
+
+// ReserveAll tries to reserve all the given variable names. If they're all available,
+// they are reserved and the function returns true. Otherwise the function returns false.
+func (r *ReservedVars) ReserveAll(names ...string) bool {
+	for _, name := range names {
+		if _, ok := r.reserved[name]; ok {
+			return false
+		}
+	}
+	for _, name := range names {
+		r.reserved[name] = struct{}{}
+	}
+	return true
+}
+
+// ReserveColName reserves a variable name for the given column; if a variable
+// with the same name already exists, it'll be suffixed with a numberic identifier
+// to make it unique.
+func (r *ReservedVars) ReserveColName(col *ColName) string {
+	compliantName := col.CompliantName()
+	if r.fast && strings.HasPrefix(compliantName, r.prefix) {
+		compliantName = "_" + compliantName
+	}
+
+	joinVar := []byte(compliantName)
+	baseLen := len(joinVar)
+	i := int64(1)
+
+	for {
+		if _, ok := r.reserved[string(joinVar)]; !ok {
+			return string(joinVar)
+		}
+		joinVar = strconv.AppendInt(joinVar[:baseLen], i, 10)
+		i++
+	}
+}
+
+const staticBvar10 = "vtg0vtg1vtg2vtg3vtg4vtg5vtg6vtg7vtg8vtg9"
+const staticBvar100 = "vtg10vtg11vtg12vtg13vtg14vtg15vtg16vtg17vtg18vtg19vtg20vtg21vtg22vtg23vtg24vtg25vtg26vtg27vtg28vtg29vtg30vtg31vtg32vtg33vtg34vtg35vtg36vtg37vtg38vtg39vtg40vtg41vtg42vtg43vtg44vtg45vtg46vtg47vtg48vtg49vtg50vtg51vtg52vtg53vtg54vtg55vtg56vtg57vtg58vtg59vtg60vtg61vtg62vtg63vtg64vtg65vtg66vtg67vtg68vtg69vtg70vtg71vtg72vtg73vtg74vtg75vtg76vtg77vtg78vtg79vtg80vtg81vtg82vtg83vtg84vtg85vtg86vtg87vtg88vtg89vtg90vtg91vtg92vtg93vtg94vtg95vtg96vtg97vtg98vtg99"
+
+func (r *ReservedVars) nextUnusedVar() string {
+	if r.fast {
+		r.counter++
+
+		if r.static {
+			switch {
+			case r.counter < 10:
+				ofs := r.counter * 4
+				return staticBvar10[ofs : ofs+4]
+			case r.counter < 100:
+				ofs := (r.counter - 10) * 5
+				return staticBvar100[ofs : ofs+5]
+			}
+		}
+
+		r.next = strconv.AppendInt(r.next[:len(r.prefix)], int64(r.counter), 10)
+		return string(r.next)
+	}
+
+	for {
+		r.counter++
+		r.next = strconv.AppendInt(r.next[:len(r.prefix)], int64(r.counter), 10)
+
+		if _, ok := r.reserved[string(r.next)]; !ok {
+			bvar := string(r.next)
+			r.reserved[bvar] = struct{}{}
+			return bvar
+		}
+	}
+}
+
+// NewReservedVars allocates a ReservedVar instance that will generate unique
+// variable names starting with the given `prefix` and making sure that they
+// don't conflict with the given set of `known` variables.
+func NewReservedVars(prefix string, known BindVars) *ReservedVars {
+	rv := &ReservedVars{
+		prefix:   prefix,
+		counter:  0,
+		reserved: known,
+		fast:     true,
+		next:     []byte(prefix),
+	}
+
+	if prefix != "" && prefix[0] == '_' {
+		panic("cannot reserve variables with a '_' prefix")
+	}
+
+	for bvar := range known {
+		if strings.HasPrefix(bvar, prefix) {
+			rv.fast = false
+			break
+		}
+	}
+
+	if prefix == "vtg" {
+		rv.static = true
+	}
+	return rv
+}
+
 // PrepareAST will normalize the query
-func PrepareAST(in Statement, bindVars map[string]*querypb.BindVariable, prefix string, parameterize bool, keyspace string) (*RewriteASTResult, error) {
+func PrepareAST(in Statement, reservedVars *ReservedVars, bindVars map[string]*querypb.BindVariable, parameterize bool, keyspace string) (*RewriteASTResult, error) {
 	if parameterize {
-		Normalize(in, bindVars, prefix)
+		err := Normalize(in, reservedVars, bindVars)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return RewriteAST(in, keyspace)
 }
@@ -45,12 +159,14 @@ func RewriteAST(in Statement, keyspace string) (*RewriteASTResult, error) {
 	er := newExpressionRewriter(keyspace)
 	er.shouldRewriteDatabaseFunc = shouldRewriteDatabaseFunc(in)
 	setRewriter := &setNormalizer{}
-	out, ok := Rewrite(in, er.rewrite, setRewriter.rewriteSetComingUp).(Statement)
-	if !ok {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "statement rewriting returned a non statement: %s", String(out))
-	}
+	result := Rewrite(in, er.rewrite, setRewriter.rewriteSetComingUp)
 	if setRewriter.err != nil {
 		return nil, setRewriter.err
+	}
+
+	out, ok := result.(Statement)
+	if !ok {
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "statement rewriting returned a non statement: %s", String(out))
 	}
 
 	r := &RewriteASTResult{
@@ -178,6 +294,13 @@ func (er *expressionRewriter) rewrite(cursor *Cursor) bool {
 			node.Expr = aliasTableName
 			cursor.Replace(node)
 		}
+	case *ShowBasic:
+		if node.Command == VariableGlobal || node.Command == VariableSession {
+			varsToAdd := sysvars.GetInterestingVariables()
+			for _, sysVar := range varsToAdd {
+				er.bindVars.AddSysVar(sysVar)
+			}
+		}
 	}
 	return true
 }
@@ -229,18 +352,19 @@ func (er *expressionRewriter) sysVarRewrite(cursor *Cursor, node *ColName) {
 	switch lowered {
 	case sysvars.Autocommit.Name,
 		sysvars.ClientFoundRows.Name,
-		sysvars.SkipQueryPlanCache.Name,
-		sysvars.SQLSelectLimit.Name,
-		sysvars.TransactionMode.Name,
-		sysvars.Workload.Name,
 		sysvars.DDLStrategy.Name,
-		sysvars.SessionUUID.Name,
-		sysvars.SessionEnableSystemSettings.Name,
+		sysvars.TransactionMode.Name,
 		sysvars.ReadAfterWriteGTID.Name,
 		sysvars.ReadAfterWriteTimeOut.Name,
+		sysvars.SessionEnableSystemSettings.Name,
+		sysvars.SessionTrackGTIDs.Name,
+		sysvars.SessionUUID.Name,
+		sysvars.SkipQueryPlanCache.Name,
+		sysvars.Socket.Name,
+		sysvars.SQLSelectLimit.Name,
 		sysvars.Version.Name,
 		sysvars.VersionComment.Name,
-		sysvars.SessionTrackGTIDs.Name:
+		sysvars.Workload.Name:
 		cursor.Replace(bindVarExpression("__vt" + lowered))
 		er.bindVars.AddSysVar(lowered)
 	}
@@ -310,7 +434,7 @@ func (er *expressionRewriter) unnestSubQueries(cursor *Cursor, subquery *Subquer
 }
 
 func bindVarExpression(name string) Expr {
-	return NewArgument([]byte(":" + name))
+	return NewArgument(name)
 }
 
 // SystemSchema returns true if the schema passed is system schema
@@ -319,4 +443,189 @@ func SystemSchema(schema string) bool {
 		strings.EqualFold(schema, "performance_schema") ||
 		strings.EqualFold(schema, "sys") ||
 		strings.EqualFold(schema, "mysql")
+}
+
+// RewriteToCNF walks the input AST and rewrites any boolean logic into CNF
+// Note: In order to re-plan, we need to empty the accumulated metadata in the AST,
+// so ColName.Metadata will be nil:ed out as part of this rewrite
+func RewriteToCNF(ast SQLNode) SQLNode {
+	for {
+		finishedRewrite := true
+		ast = Rewrite(ast, func(cursor *Cursor) bool {
+			if e, isExpr := cursor.node.(Expr); isExpr {
+				rewritten, didRewrite := rewriteToCNFExpr(e)
+				if didRewrite {
+					finishedRewrite = false
+					cursor.Replace(rewritten)
+				}
+			}
+			if col, isCol := cursor.node.(*ColName); isCol {
+				col.Metadata = nil
+			}
+			return true
+		}, nil)
+
+		if finishedRewrite {
+			return ast
+		}
+	}
+}
+
+func distinctOr(in *OrExpr) (Expr, bool) {
+	todo := []*OrExpr{in}
+	var leaves []Expr
+	for len(todo) > 0 {
+		curr := todo[0]
+		todo = todo[1:]
+		addAnd := func(in Expr) {
+			and, ok := in.(*OrExpr)
+			if ok {
+				todo = append(todo, and)
+			} else {
+				leaves = append(leaves, in)
+			}
+		}
+		addAnd(curr.Left)
+		addAnd(curr.Right)
+	}
+	original := len(leaves)
+	var predicates []Expr
+
+outer1:
+	for len(leaves) > 0 {
+		curr := leaves[0]
+		leaves = leaves[1:]
+		for _, alreadyIn := range predicates {
+			if EqualsExpr(alreadyIn, curr) {
+				continue outer1
+			}
+		}
+		predicates = append(predicates, curr)
+	}
+	if original == len(predicates) {
+		return in, false
+	}
+	var result Expr
+	for i, curr := range predicates {
+		if i == 0 {
+			result = curr
+			continue
+		}
+		result = &OrExpr{Left: result, Right: curr}
+	}
+	return result, true
+}
+func distinctAnd(in *AndExpr) (Expr, bool) {
+	todo := []*AndExpr{in}
+	var leaves []Expr
+	for len(todo) > 0 {
+		curr := todo[0]
+		todo = todo[1:]
+		addAnd := func(in Expr) {
+			and, ok := in.(*AndExpr)
+			if ok {
+				todo = append(todo, and)
+			} else {
+				leaves = append(leaves, in)
+			}
+		}
+		addAnd(curr.Left)
+		addAnd(curr.Right)
+	}
+	original := len(leaves)
+	var predicates []Expr
+
+outer1:
+	for len(leaves) > 0 {
+		curr := leaves[0]
+		leaves = leaves[1:]
+		for _, alreadyIn := range predicates {
+			if EqualsExpr(alreadyIn, curr) {
+				continue outer1
+			}
+		}
+		predicates = append(predicates, curr)
+	}
+	if original == len(predicates) {
+		return in, false
+	}
+	var result Expr
+	for i, curr := range predicates {
+		if i == 0 {
+			result = curr
+			continue
+		}
+		result = &AndExpr{Left: result, Right: curr}
+	}
+	return result, true
+}
+
+func rewriteToCNFExpr(expr Expr) (Expr, bool) {
+	switch expr := expr.(type) {
+	case *NotExpr:
+		switch child := expr.Expr.(type) {
+		case *NotExpr:
+			// NOT NOT A => A
+			return child.Expr, true
+		case *OrExpr:
+			// DeMorgan Rewriter
+			// NOT (A OR B) => NOT A AND NOT B
+			return &AndExpr{Right: &NotExpr{Expr: child.Right}, Left: &NotExpr{Expr: child.Left}}, true
+		case *AndExpr:
+			// DeMorgan Rewriter
+			// NOT (A AND B) => NOT A OR NOT B
+			return &OrExpr{Right: &NotExpr{Expr: child.Right}, Left: &NotExpr{Expr: child.Left}}, true
+		}
+	case *OrExpr:
+		or := expr
+		if and, ok := or.Left.(*AndExpr); ok {
+			// Simplification
+			// (A AND B) OR A => A
+			if EqualsExpr(or.Right, and.Left) || EqualsExpr(or.Right, and.Right) {
+				return or.Right, true
+			}
+			// Distribution Law
+			// (A AND B) OR C => (A OR C) AND (B OR C)
+			return &AndExpr{Left: &OrExpr{Left: and.Left, Right: or.Right}, Right: &OrExpr{Left: and.Right, Right: or.Right}}, true
+		}
+		if and, ok := or.Right.(*AndExpr); ok {
+			// Simplification
+			// A OR (A AND B) => A
+			if EqualsExpr(or.Left, and.Left) || EqualsExpr(or.Left, and.Right) {
+				return or.Left, true
+			}
+			// Distribution Law
+			// C OR (A AND B) => (C OR A) AND (C OR B)
+			return &AndExpr{Left: &OrExpr{Left: or.Left, Right: and.Left}, Right: &OrExpr{Left: or.Left, Right: and.Right}}, true
+		}
+		// Try to make distinct
+		return distinctOr(expr)
+
+	case *XorExpr:
+		// DeMorgan Rewriter
+		// (A XOR B) => (A OR B) AND NOT (A AND B)
+		return &AndExpr{Left: &OrExpr{Left: expr.Left, Right: expr.Right}, Right: &NotExpr{Expr: &AndExpr{Left: expr.Left, Right: expr.Right}}}, true
+	case *AndExpr:
+		res, rewritten := distinctAnd(expr)
+		if rewritten {
+			return res, rewritten
+		}
+		and := expr
+		if or, ok := and.Left.(*OrExpr); ok {
+			// Simplification
+			// (A OR B) AND A => A
+			if EqualsExpr(or.Left, and.Right) || EqualsExpr(or.Right, and.Right) {
+				return and.Right, true
+			}
+		}
+		if or, ok := and.Right.(*OrExpr); ok {
+			// Simplification
+			// A OR (A AND B) => A
+			if EqualsExpr(or.Left, and.Left) || EqualsExpr(or.Right, and.Left) {
+				return or.Left, true
+			}
+		}
+
+	}
+	return expr, false
 }

@@ -52,7 +52,7 @@ func TestLogStatsFormat(t *testing.T) {
 	*streamlog.RedactDebugUIQueries = false
 	*streamlog.QueryLogFormat = "text"
 	got := testFormat(logStats, url.Values(params))
-	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1\"\tmap[intVal:type:INT64 value:\"1\" ]\t0\t0\t\"\"\t\"ks\"\t\"table\"\t\"MASTER\"\t\n"
+	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1\"\tmap[intVal:type:INT64 value:\"1\"]\t0\t0\t\"\"\t\"ks\"\t\"table\"\t\"MASTER\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
@@ -106,7 +106,7 @@ func TestLogStatsFormat(t *testing.T) {
 
 	*streamlog.QueryLogFormat = "text"
 	got = testFormat(logStats, url.Values(params))
-	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1\"\tmap[strVal:type:VARBINARY value:\"abc\" ]\t0\t0\t\"\"\t\"ks\"\t\"table\"\t\"MASTER\"\t\n"
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1\"\tmap[strVal:type:VARBINARY value:\"abc\"]\t0\t0\t\"\"\t\"ks\"\t\"table\"\t\"MASTER\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
@@ -138,19 +138,48 @@ func TestLogStatsFilter(t *testing.T) {
 	params := map[string][]string{"full": {}}
 
 	got := testFormat(logStats, url.Values(params))
-	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\" ]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
+	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\"]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
 	*streamlog.QueryLogFilterTag = "LOG_THIS_QUERY"
 	got = testFormat(logStats, url.Values(params))
-	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\" ]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\"]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
 	if got != want {
 		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
 	}
 
 	*streamlog.QueryLogFilterTag = "NOT_THIS_QUERY"
+	got = testFormat(logStats, url.Values(params))
+	want = ""
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
+	}
+}
+
+func TestLogStatsRowThreshold(t *testing.T) {
+	defer func() { *streamlog.QueryLogRowThreshold = 0 }()
+
+	logStats := NewLogStats(context.Background(), "test", "sql1 /* LOG_THIS_QUERY */", map[string]*querypb.BindVariable{"intVal": sqltypes.Int64BindVariable(1)})
+	logStats.StartTime = time.Date(2017, time.January, 1, 1, 2, 3, 0, time.UTC)
+	logStats.EndTime = time.Date(2017, time.January, 1, 1, 2, 4, 1234, time.UTC)
+	params := map[string][]string{"full": {}}
+
+	got := testFormat(logStats, url.Values(params))
+	want := "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\"]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
+	}
+
+	*streamlog.QueryLogRowThreshold = 0
+	got = testFormat(logStats, url.Values(params))
+	want = "test\t\t\t''\t''\t2017-01-01 01:02:03.000000\t2017-01-01 01:02:04.000001\t1.000001\t0.000000\t0.000000\t0.000000\t\t\"sql1 /* LOG_THIS_QUERY */\"\tmap[intVal:type:INT64 value:\"1\"]\t0\t0\t\"\"\t\"\"\t\"\"\t\"\"\t\n"
+	if got != want {
+		t.Errorf("logstats format: got:\n%q\nwant:\n%q\n", got, want)
+	}
+
+	*streamlog.QueryLogRowThreshold = 1
 	got = testFormat(logStats, url.Values(params))
 	want = ""
 	if got != want {

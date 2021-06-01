@@ -25,7 +25,7 @@ import (
 
 	"context"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
@@ -39,7 +39,7 @@ import (
 // FakeQueryService implements a programmable fake for the query service
 // server side.
 type FakeQueryService struct {
-	t              *testing.T
+	t              testing.TB
 	TestingGateway bool
 
 	// these fields are used to simulate and synchronize on errors
@@ -720,7 +720,7 @@ func (f *FakeQueryService) VStreamResults(ctx context.Context, target *querypb.T
 }
 
 // QueryServiceByAlias satisfies the Gateway interface
-func (f *FakeQueryService) QueryServiceByAlias(_ *topodatapb.TabletAlias) (queryservice.QueryService, error) {
+func (f *FakeQueryService) QueryServiceByAlias(_ *topodatapb.TabletAlias, _ *querypb.Target) (queryservice.QueryService, error) {
 	panic("not implemented")
 }
 
@@ -740,7 +740,7 @@ func (f *FakeQueryService) Release(ctx context.Context, target *querypb.Target, 
 }
 
 // CreateFakeServer returns the fake server for the tests
-func CreateFakeServer(t *testing.T) *FakeQueryService {
+func CreateFakeServer(t testing.TB) *FakeQueryService {
 	return &FakeQueryService{
 		t: t,
 	}

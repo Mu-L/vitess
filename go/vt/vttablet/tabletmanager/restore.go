@@ -17,33 +17,28 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"time"
 
-	"vitess.io/vitess/go/vt/proto/vttime"
-
-	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
-
-	"vitess.io/vitess/go/vt/dbconfigs"
-
-	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
-
-	"context"
-
-	"vitess.io/vitess/go/vt/log"
-
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/hook"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/proto/vttime"
 )
 
 // This file handles the initial backup restore upon startup.
@@ -78,7 +73,68 @@ func (tm *TabletManager) RestoreData(ctx context.Context, logger logutil.Logger,
 	if tm.Cnf == nil {
 		return fmt.Errorf("cannot perform restore without my.cnf, please restart vttablet with a my.cnf file specified")
 	}
-	return tm.restoreDataLocked(ctx, logger, waitForBackupInterval, deleteBeforeRestore)
+	// Tell Orchestrator we're stopped on purpose for some Vitess task.
+	// Do this in the background, as it's best-effort.
+	go func() {
+		if tm.orc == nil {
+			return
+		}
+		if err := tm.orc.BeginMaintenance(tm.Tablet(), "vttablet has been told to Restore"); err != nil {
+			log.Warningf("Orchestrator BeginMaintenance failed: %v", err)
+		}
+	}()
+
+	var (
+		err       error
+		startTime time.Time
+	)
+
+	defer func() {
+		stopTime := time.Now()
+
+		h := hook.NewSimpleHook("vttablet_restore_done")
+		h.ExtraEnv = tm.hookExtraEnv()
+		h.ExtraEnv["TM_RESTORE_DATA_START_TS"] = startTime.UTC().Format(time.RFC3339)
+		h.ExtraEnv["TM_RESTORE_DATA_STOP_TS"] = stopTime.UTC().Format(time.RFC3339)
+		h.ExtraEnv["TM_RESTORE_DATA_DURATION"] = stopTime.Sub(startTime).String()
+
+		if err != nil {
+			h.ExtraEnv["TM_RESTORE_DATA_ERROR"] = err.Error()
+		}
+
+		// vttablet_restore_done is best-effort (for now?).
+		go func() {
+			// Package vthook already logs the stdout/stderr of hooks when they
+			// are run, so we don't duplicate that here.
+			hr := h.Execute()
+			switch hr.ExitStatus {
+			case hook.HOOK_SUCCESS:
+			case hook.HOOK_DOES_NOT_EXIST:
+				log.Info("No vttablet_restore_done hook.")
+			default:
+				log.Warning("vttablet_restore_done hook failed")
+			}
+		}()
+	}()
+
+	startTime = time.Now()
+
+	err = tm.restoreDataLocked(ctx, logger, waitForBackupInterval, deleteBeforeRestore)
+	if err != nil {
+		return err
+	}
+
+	// Tell Orchestrator we're no longer stopped on purpose.
+	// Do this in the background, as it's best-effort.
+	go func() {
+		if tm.orc == nil {
+			return
+		}
+		if err := tm.orc.EndMaintenance(tm.Tablet()); err != nil {
+			log.Warningf("Orchestrator EndMaintenance failed: %v", err)
+		}
+	}()
+	return nil
 }
 
 func (tm *TabletManager) restoreDataLocked(ctx context.Context, logger logutil.Logger, waitForBackupInterval time.Duration, deleteBeforeRestore bool) error {
@@ -470,10 +526,15 @@ func (tm *TabletManager) startReplication(ctx context.Context, pos mysql.Positio
 	}
 
 	// Set master and start replication.
-	if err := tm.MysqlDaemon.SetMaster(ctx, ti.Tablet.MysqlHostname, int(ti.Tablet.MysqlPort), false /* stopReplicationBefore */, true /* startReplicationAfter */); err != nil {
+	if err := tm.MysqlDaemon.SetMaster(ctx, ti.Tablet.MysqlHostname, int(ti.Tablet.MysqlPort), false /* stopReplicationBefore */, !*mysqlctl.DisableActiveReparents /* startReplicationAfter */); err != nil {
 		return vterrors.Wrap(err, "MysqlDaemon.SetMaster failed")
 	}
 
+	// If active reparents are disabled, we don't restart replication. So it makes no sense to wait for an update on the replica.
+	// Return immediately.
+	if *mysqlctl.DisableActiveReparents {
+		return nil
+	}
 	// wait for reliable seconds behind master
 	// we have pos where we want to resume from
 	// if MasterPosition is the same, that means no writes

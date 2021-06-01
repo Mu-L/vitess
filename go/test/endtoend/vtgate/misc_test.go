@@ -21,17 +21,14 @@ import (
 	"fmt"
 	"testing"
 
-	"vitess.io/vitess/go/test/utils"
-
 	"github.com/google/go-cmp/cmp"
-
 	"github.com/stretchr/testify/assert"
-
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/utils"
 )
 
 func TestSelectNull(t *testing.T) {
@@ -75,6 +72,18 @@ func TestShowColumns(t *testing.T) {
 	assertMatches(t, conn, "show columns from `t5_null_vindex` in `ks`", expected)
 	assertMatches(t, conn, "SHOW COLUMNS from `t5_null_vindex` in `ks`", expected)
 	assertMatches(t, conn, "SHOW columns FROM `t5_null_vindex` in `ks`", expected)
+}
+
+func TestShowTables(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	query := "show tables;"
+	qr := exec(t, conn, query)
+
+	assert.Equal(t, "information_schema", qr.Fields[0].Database)
+	assert.Equal(t, "Tables_in_ks", qr.Fields[0].Name)
 }
 
 func TestCastConvert(t *testing.T) {
@@ -527,6 +536,130 @@ func TestFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 	exec(t, conn, "flush local tables t1, t2")
+}
+
+func TestShowVariables(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	res := exec(t, conn, "show variables like \"%version%\";")
+	found := false
+	for _, row := range res.Rows {
+		if row[0].ToString() == "version" {
+			assert.Contains(t, row[1].ToString(), "vitess")
+			found = true
+		}
+	}
+	require.True(t, found, "Expected a row for version in show query")
+}
+
+func TestOrderBy(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.Nil(t, err)
+	defer conn.Close()
+	exec(t, conn, "insert into t4(id1, id2) values(1,'a'), (2,'Abc'), (3,'b'), (4,'c'), (5,'test')")
+	exec(t, conn, "insert into t4(id1, id2) values(6,'d'), (7,'e'), (8,'F')")
+	// test ordering of varchar column
+	assertMatches(t, conn, "select id1, id2 from t4 order by id2 desc", `[[INT64(5) VARCHAR("test")] [INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+	// test ordering of int column
+	assertMatches(t, conn, "select id1, id2 from t4 order by id1 desc", `[[INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(5) VARCHAR("test")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+
+	defer func() {
+		exec(t, conn, "set workload = oltp")
+		exec(t, conn, "delete from t4")
+	}()
+	// Test the same queries in streaming mode
+	exec(t, conn, "set workload = olap")
+	assertMatches(t, conn, "select id1, id2 from t4 order by id2 desc", `[[INT64(5) VARCHAR("test")] [INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+	assertMatches(t, conn, "select id1, id2 from t4 order by id1 desc", `[[INT64(8) VARCHAR("F")] [INT64(7) VARCHAR("e")] [INT64(6) VARCHAR("d")] [INT64(5) VARCHAR("test")] [INT64(4) VARCHAR("c")] [INT64(3) VARCHAR("b")] [INT64(2) VARCHAR("Abc")] [INT64(1) VARCHAR("a")]]`)
+}
+
+func TestSubQueryOnTopOfSubQuery(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	defer exec(t, conn, `delete from t1`)
+
+	exec(t, conn, `insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`)
+	exec(t, conn, `insert into t2(id3, id4) values (1, 3), (2, 4)`)
+
+	assertMatches(t, conn, "select id1 from t1 where id1 not in (select id3 from t2) and id2 in (select id4 from t2) order by id1", `[[INT64(3)] [INT64(4)]]`)
+}
+
+func TestShowVGtid(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	query := "show global vgtid_executed from ks"
+	qr := exec(t, conn, query)
+	require.Equal(t, 1, len(qr.Rows))
+	require.Equal(t, 2, len(qr.Rows[0]))
+
+	defer exec(t, conn, `delete from t1`)
+	exec(t, conn, `insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`)
+	qr2 := exec(t, conn, query)
+	require.Equal(t, 1, len(qr2.Rows))
+	require.Equal(t, 2, len(qr2.Rows[0]))
+
+	require.Equal(t, qr.Rows[0][0], qr2.Rows[0][0], "keyspace should be same")
+	require.NotEqual(t, qr.Rows[0][1].ToString(), qr2.Rows[0][1].ToString(), "vgtid should have changed")
+}
+
+func TestShowGtid(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	query := "show global gtid_executed from ks"
+	qr := exec(t, conn, query)
+	require.Equal(t, 2, len(qr.Rows))
+
+	res := make(map[string]string, 2)
+	for _, row := range qr.Rows {
+		require.Equal(t, KeyspaceName, row[0].ToString())
+		res[row[2].ToString()] = row[1].ToString()
+	}
+
+	defer exec(t, conn, `delete from t1`)
+	exec(t, conn, `insert into t1(id1, id2) values (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)`)
+	qr2 := exec(t, conn, query)
+	require.Equal(t, 2, len(qr2.Rows))
+
+	for _, row := range qr2.Rows {
+		require.Equal(t, KeyspaceName, row[0].ToString())
+		gtid, exists := res[row[2].ToString()]
+		require.True(t, exists, "gtid not cached for row: %v", row)
+		require.NotEqual(t, gtid, row[1].ToString())
+	}
+}
+
+func TestQueryAndSubQWithLimit(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "insert into t1(id1, id2) values(0,0),(1,1),(2,2),(3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),(9,9)")
+	result := exec(t, conn, `select id1, id2 from t1 where id1 >= ( select id1 from t1 order by id1 asc limit 1) limit 100`)
+	assert.Equal(t, 10, len(result.Rows))
+}
+
+func TestSchemaTracker(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+	// this query only works if we know which table the testId belongs to. The vschema does not contain
+	// this info, so we are testing that the schema tracker has added column info to the vschema
+	_, err = conn.ExecuteFetch(`select testId from t8 join t2`, 1000, true)
+	require.NoError(t, err)
 }
 
 func assertMatches(t *testing.T, conn *mysql.Conn, query, expected string) {

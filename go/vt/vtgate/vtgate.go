@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/key"
+
 	"context"
 
 	"vitess.io/vitess/go/acl"
@@ -42,8 +44,9 @@ import (
 	"vitess.io/vitess/go/vt/srvtopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
-
 	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
+
+	vtschema "vitess.io/vitess/go/vt/vtgate/schema"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -64,6 +67,7 @@ var (
 	maxMemoryRows        = flag.Int("max_memory_rows", 300000, "Maximum number of rows that will be held in memory for intermediate results as well as the final result.")
 	warnMemoryRows       = flag.Int("warn_memory_rows", 30000, "Warning threshold for in-memory results. A row count higher than this amount will cause the VtGateWarnings.ResultsExceeded counter to be incremented.")
 	defaultDDLStrategy   = flag.String("ddl_strategy", string(schema.DDLStrategyDirect), "Set default strategy for DDL statements. Override with @@ddl_strategy session variable")
+	dbDDLPlugin          = flag.String("dbddl_plugin", "fail", "controls how to handle CREATE/DROP DATABASE. use it if you are using your own database provisioning service")
 
 	// TODO(deepthi): change these two vars to unexported and move to healthcheck.go when LegacyHealthcheck is removed
 
@@ -80,6 +84,15 @@ var (
 
 	// lockHeartbeatTime is used to set the next heartbeat time.
 	lockHeartbeatTime = flag.Duration("lock_heartbeat_time", 5*time.Second, "If there is lock function used. This will keep the lock connection active by using this heartbeat")
+	warnShardedOnly   = flag.Bool("warn_sharded_only", false, "If any features that are only available in unsharded mode are used, query execution warnings will be added to the session")
+
+	foreignKeyMode = flag.String("foreign_key_mode", "allow", "This is to provide how to handle foreign key constraint in create/alter table. Valid values are: allow, disallow")
+
+	// flags to enable/disable online and direct DDL statements
+	enableOnlineDDL = flag.Bool("enable_online_ddl", true, "Allow users to submit, review and control Online DDL")
+	enableDirectDDL = flag.Bool("enable_direct_ddl", true, "Allow users to submit direct DDL statements")
+
+	enableSchemaChangeSignal = flag.Bool("schema_change_signal", false, "Enable the schema tracker")
 )
 
 func getTxMode() vtgatepb.TransactionMode {
@@ -110,6 +123,8 @@ var (
 	errorCounts *stats.CountersWithMultiLabels
 
 	warnings *stats.CountersWithSingleLabel
+
+	vstreamSkewDelayCount *stats.Counter
 )
 
 // VTGate is the rpc interface to vtgate. Only one instance
@@ -151,6 +166,9 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 	// catch the initial load stats.
 	vschemaCounters = stats.NewCountersWithSingleLabel("VtgateVSchemaCounts", "Vtgate vschema counts", "changes")
 
+	vstreamSkewDelayCount = stats.NewCounter("VStreamEventsDelayedBySkewAlignment",
+		"Number of events that had to wait because the skew across shards was too high")
+
 	// Build objects from low to high level.
 	// Start with the gateway. If we can't reach the topology service,
 	// we can't go on much further, so we log.Fatal out.
@@ -163,7 +181,7 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 
 	// If we want to filter keyspaces replace the srvtopo.Server with a
 	// filtering server
-	if len(discovery.KeyspacesToWatch) > 0 {
+	if discovery.FilteringKeyspaces() {
 		log.Infof("Keyspace filtering enabled, selecting %v", discovery.KeyspacesToWatch)
 		var err error
 		serv, err = srvtopo.NewKeyspaceFilteringServer(serv, discovery.KeyspacesToWatch)
@@ -172,7 +190,7 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 		}
 	}
 
-	if _, _, err := schema.ParseDDLStrategy(*defaultDDLStrategy); err != nil {
+	if _, err := schema.ParseDDLStrategy(*defaultDDLStrategy); err != nil {
 		log.Fatalf("Invalid value for -ddl_strategy: %v", err.Error())
 	}
 	tc := NewTxConn(gw, getTxMode())
@@ -181,14 +199,32 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 	srvResolver := srvtopo.NewResolver(serv, gw, cell)
 	resolver := NewResolver(srvResolver, serv, cell, sc)
 	vsm := newVStreamManager(srvResolver, serv, cell)
+
+	var si SchemaInfo = nil
+	var st *vtschema.Tracker
+	if *enableSchemaChangeSignal {
+		st = vtschema.NewTracker(gw.hc.Subscribe())
+		addKeyspaceToTracker(ctx, srvResolver, st, gw)
+		si = st
+	}
+
 	cacheCfg := &cache.Config{
 		MaxEntries:     *queryPlanCacheSize,
 		MaxMemoryUsage: *queryPlanCacheMemory,
 		LFU:            *queryPlanCacheLFU,
 	}
 
+	executor := NewExecutor(ctx, serv, cell, resolver, *normalizeQueries, *warnShardedOnly, *streamBufferSize, cacheCfg, si)
+
+	// connect the schema tracker with the vschema manager
+	if *enableSchemaChangeSignal {
+		st.RegisterSignalReceiver(executor.vm.Rebuild)
+	}
+
+	// TODO: call serv.WatchSrvVSchema here
+
 	rpcVTGate = &VTGate{
-		executor: NewExecutor(ctx, serv, cell, resolver, *normalizeQueries, *streamBufferSize, cacheCfg),
+		executor: executor,
 		resolver: resolver,
 		vsm:      vsm,
 		txConn:   tc,
@@ -227,6 +263,14 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 		for _, f := range RegisterVTGates {
 			f(rpcVTGate)
 		}
+		if st != nil && *enableSchemaChangeSignal {
+			st.Start()
+		}
+	})
+	servenv.OnTerm(func() {
+		if st != nil && *enableSchemaChangeSignal {
+			st.Stop()
+		}
 	})
 	rpcVTGate.registerDebugHealthHandler()
 	err := initQueryLogger(rpcVTGate)
@@ -237,6 +281,44 @@ func Init(ctx context.Context, serv srvtopo.Server, cell string, tabletTypesToWa
 	initAPI(gw.hc)
 
 	return rpcVTGate
+}
+
+func addKeyspaceToTracker(ctx context.Context, srvResolver *srvtopo.Resolver, st *vtschema.Tracker, gw *TabletGateway) {
+	keyspaces, err := srvResolver.GetAllKeyspaces(ctx)
+	if err != nil {
+		log.Warningf("Unable to get all keyspaces: %v", err)
+		return
+	}
+	if len(keyspaces) == 0 {
+		log.Infof("No keyspace to load")
+	}
+	for _, keyspace := range keyspaces {
+		resolveAndLoadKeyspace(ctx, srvResolver, st, gw, keyspace)
+	}
+}
+
+func resolveAndLoadKeyspace(ctx context.Context, srvResolver *srvtopo.Resolver, st *vtschema.Tracker, gw *TabletGateway, keyspace string) {
+	dest, err := srvResolver.ResolveDestination(ctx, keyspace, topodatapb.TabletType_MASTER, key.DestinationAllShards{})
+	if err != nil {
+		log.Warningf("Unable to resolve destination: %v", err)
+		return
+	}
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			log.Warningf("Unable to get initial schema reload")
+			return
+		case <-time.After(500 * time.Millisecond):
+			for _, shard := range dest {
+				err := st.LoadKeyspace(gw, shard.Target)
+				if err == nil {
+					return
+				}
+				log.Warningf("Unable to add keyspace to tracker: %v", err)
+			}
+		}
+	}
 }
 
 func (vtg *VTGate) registerDebugHealthHandler() {
@@ -342,7 +424,7 @@ func (vtg *VTGate) StreamExecute(ctx context.Context, session *vtgatepb.Session,
 			NewSafeSession(session),
 			sql,
 			bindVariables,
-			querypb.Target{
+			&querypb.Target{
 				Keyspace:   destKeyspace,
 				TabletType: destTabletType,
 			},
@@ -403,8 +485,8 @@ handleError:
 }
 
 // VStream streams binlog events.
-func (vtg *VTGate) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
-	return vtg.vsm.VStream(ctx, tabletType, vgtid, filter, send)
+func (vtg *VTGate) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags, send func([]*binlogdatapb.VEvent) error) error {
+	return vtg.vsm.VStream(ctx, tabletType, vgtid, filter, flags, send)
 }
 
 // GetGatewayCacheStatus returns a displayable version of the Gateway cache.
@@ -455,15 +537,26 @@ func recordAndAnnotateError(err error, statsKey []string, request map[string]int
 		logger.Errorf("%v, request: %+v", err, request)
 	case vtrpcpb.Code_UNAVAILABLE:
 		logger.Infof("%v, request: %+v", err, request)
+	case vtrpcpb.Code_UNIMPLEMENTED:
+		sql, exists := request["Sql"]
+		if !exists {
+			return err
+		}
+		piiSafeSQL, err2 := sqlparser.RedactSQLQuery(sql.(string))
+		if err2 != nil {
+			return err
+		}
+		// log only if sql query present and able to successfully redact the PII.
+		logger.Infof("unsupported query: %q", piiSafeSQL)
 	}
-	return vterrors.Wrapf(err, "vtgate: %s", servenv.ListeningURL.String())
+	return err
 }
 
 func formatError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return vterrors.Wrapf(err, "vtgate: %s", servenv.ListeningURL.String())
+	return err
 }
 
 // HandlePanic recovers from panics, and logs / increment counters
@@ -496,7 +589,7 @@ func LegacyInit(ctx context.Context, hc discovery.LegacyHealthCheck, serv srvtop
 
 	// If we want to filter keyspaces replace the srvtopo.Server with a
 	// filtering server
-	if len(discovery.KeyspacesToWatch) > 0 {
+	if discovery.FilteringKeyspaces() {
 		log.Infof("Keyspace filtering enabled, selecting %v", discovery.KeyspacesToWatch)
 		var err error
 		serv, err = srvtopo.NewKeyspaceFilteringServer(serv, discovery.KeyspacesToWatch)
@@ -518,7 +611,7 @@ func LegacyInit(ctx context.Context, hc discovery.LegacyHealthCheck, serv srvtop
 	}
 
 	rpcVTGate = &VTGate{
-		executor: NewExecutor(ctx, serv, cell, resolver, *normalizeQueries, *streamBufferSize, cacheCfg),
+		executor: NewExecutor(ctx, serv, cell, resolver, *normalizeQueries, *warnShardedOnly, *streamBufferSize, cacheCfg, nil),
 		resolver: resolver,
 		vsm:      vsm,
 		txConn:   tc,

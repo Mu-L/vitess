@@ -23,7 +23,7 @@ import (
 
 	"context"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
@@ -66,7 +66,8 @@ func (f *fakeVTGateService) Execute(ctx context.Context, session *vtgatepb.Sessi
 		return session, nil, fmt.Errorf("Execute request mismatch: got %+v, want %+v", query, execCase.execQuery)
 	}
 	if execCase.session != nil {
-		*session = *execCase.session
+		proto.Reset(session)
+		proto.Merge(session, execCase.session)
 	}
 	return session, execCase.result, nil
 }
@@ -90,7 +91,8 @@ func (f *fakeVTGateService) ExecuteBatch(ctx context.Context, session *vtgatepb.
 			return session, nil, fmt.Errorf("Execute request mismatch: got %+v, want %+v", query, execCase.execQuery)
 		}
 		if execCase.session != nil {
-			*session = *execCase.session
+			proto.Reset(session)
+			proto.Merge(session, execCase.session)
 		}
 		return session, []sqltypes.QueryResponse{
 			{QueryResult: execCase.result},
@@ -140,7 +142,7 @@ func (f *fakeVTGateService) ResolveTransaction(ctx context.Context, dtid string)
 	return nil
 }
 
-func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
+func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags, send func([]*binlogdatapb.VEvent) error) error {
 	return nil
 }
 

@@ -36,27 +36,7 @@ import (
 // is interrupted, and the error is returned.
 func Walk(visit Visit, nodes ...SQLNode) error {
 	for _, node := range nodes {
-		if node == nil {
-			continue
-		}
-		var err error
-		var kontinue bool
-		pre := func(cursor *Cursor) bool {
-			// If we already have found an error, don't visit these nodes, just exit early
-			if err != nil {
-				return false
-			}
-			kontinue, err = visit(cursor.Node())
-			if err != nil {
-				return true // we have to return true here so that post gets called
-			}
-			return kontinue
-		}
-		post := func(cursor *Cursor) bool {
-			return err == nil // now we can abort the traversal if an error was found
-		}
-
-		Rewrite(node, pre, post)
+		err := VisitSQLNode(node, visit)
 		if err != nil {
 			return err
 		}
@@ -66,6 +46,8 @@ func Walk(visit Visit, nodes ...SQLNode) error {
 
 // Visit defines the signature of a function that
 // can be used to visit all nodes of a parse tree.
+// returning false on kontinue means that children will not be visited
+// returning an error will abort the visitation and return the error
 type Visit func(node SQLNode) (kontinue bool, err error)
 
 // Append appends the SQLNode to the buffer.
@@ -293,7 +275,7 @@ func (ct *ColumnType) SQLType() querypb.Type {
 	case keywordStrings[MULTIPOLYGON]:
 		return sqltypes.Geometry
 	}
-	panic("unimplemented type " + ct.Type)
+	return sqltypes.Null
 }
 
 // ParseParams parses the vindex parameter list, pulling out the special-case
@@ -392,9 +374,10 @@ func NewWhere(typ WhereType, expr Expr) *Where {
 // then to is returned.
 func ReplaceExpr(root, from, to Expr) Expr {
 	tmp := Rewrite(root, replaceExpr(from, to), nil)
+
 	expr, success := tmp.(Expr)
 	if !success {
-		log.Errorf("Failed to rewrite expression. Rewriter returned a non-expression: " + String(tmp))
+		log.Errorf("Failed to rewrite expression. Rewriter returned a non-expression:  %s", String(tmp))
 		return from
 	}
 
@@ -442,48 +425,48 @@ func (node *ComparisonExpr) IsImpossible() bool {
 }
 
 // NewStrLiteral builds a new StrVal.
-func NewStrLiteral(in []byte) *Literal {
+func NewStrLiteral(in string) *Literal {
 	return &Literal{Type: StrVal, Val: in}
 }
 
 // NewIntLiteral builds a new IntVal.
-func NewIntLiteral(in []byte) *Literal {
+func NewIntLiteral(in string) *Literal {
 	return &Literal{Type: IntVal, Val: in}
 }
 
 // NewFloatLiteral builds a new FloatVal.
-func NewFloatLiteral(in []byte) *Literal {
+func NewFloatLiteral(in string) *Literal {
 	return &Literal{Type: FloatVal, Val: in}
 }
 
 // NewHexNumLiteral builds a new HexNum.
-func NewHexNumLiteral(in []byte) *Literal {
+func NewHexNumLiteral(in string) *Literal {
 	return &Literal{Type: HexNum, Val: in}
 }
 
 // NewHexLiteral builds a new HexVal.
-func NewHexLiteral(in []byte) *Literal {
+func NewHexLiteral(in string) *Literal {
 	return &Literal{Type: HexVal, Val: in}
 }
 
 // NewBitLiteral builds a new BitVal containing a bit literal.
-func NewBitLiteral(in []byte) *Literal {
+func NewBitLiteral(in string) *Literal {
 	return &Literal{Type: BitVal, Val: in}
 }
 
 // NewArgument builds a new ValArg.
-func NewArgument(in []byte) Argument {
-	return in
+func NewArgument(in string) Argument {
+	return Argument(in)
+}
+
+// Bytes return the []byte
+func (node *Literal) Bytes() []byte {
+	return []byte(node.Val)
 }
 
 // HexDecode decodes the hexval into bytes.
 func (node *Literal) HexDecode() ([]byte, error) {
-	dst := make([]byte, hex.DecodedLen(len([]byte(node.Val))))
-	_, err := hex.Decode(dst, []byte(node.Val))
-	if err != nil {
-		return nil, err
-	}
-	return dst, err
+	return hex.DecodeString(node.Val)
 }
 
 // Equal returns true if the column names match.
@@ -693,11 +676,12 @@ func (node *TableIdent) UnmarshalJSON(b []byte) error {
 func containEscapableChars(s string, at AtCount) bool {
 	isDbSystemVariable := at != NoAt
 
-	for i, c := range s {
-		letter := isLetter(uint16(c))
-		systemVarChar := isDbSystemVariable && isCarat(uint16(c))
+	for i := range s {
+		c := uint16(s[i])
+		letter := isLetter(c)
+		systemVarChar := isDbSystemVariable && isCarat(c)
 		if !(letter || systemVarChar) {
-			if i == 0 || !isDigit(uint16(c)) {
+			if i == 0 || !isDigit(c) {
 				return true
 			}
 		}
@@ -706,16 +690,12 @@ func containEscapableChars(s string, at AtCount) bool {
 	return false
 }
 
-func isKeyword(s string) bool {
-	_, isKeyword := keywords[s]
-	return isKeyword
-}
-
-func formatID(buf *TrackedBuffer, original, lowered string, at AtCount) {
-	if containEscapableChars(original, at) || isKeyword(lowered) {
+func formatID(buf *TrackedBuffer, original string, at AtCount) {
+	_, isKeyword := keywordLookupTable.LookupString(original)
+	if isKeyword || containEscapableChars(original, at) {
 		writeEscapedString(buf, original)
 	} else {
-		buf.Myprintf("%s", original)
+		buf.WriteString(original)
 	}
 }
 
@@ -1249,6 +1229,8 @@ func (ty ShowCommandType) ToString() string {
 		return FunctionCStr
 	case Function:
 		return FunctionStr
+	case GtidExecGlobal:
+		return GtidExecGlobalStr
 	case Index:
 		return IndexStr
 	case OpenTable:
@@ -1273,6 +1255,12 @@ func (ty ShowCommandType) ToString() string {
 		return VariableGlobalStr
 	case VariableSession:
 		return VariableSessionStr
+	case VGtidExecGlobal:
+		return VGtidExecGlobalStr
+	case VitessMigrations:
+		return VitessMigrationsStr
+	case Warnings:
+		return WarningsStr
 	case Keyspace:
 		return KeyspaceStr
 	default:
@@ -1312,11 +1300,11 @@ func (lock LockOptionType) ToString() string {
 }
 
 // CompliantName is used to get the name of the bind variable to use for this column name
-func (node *ColName) CompliantName(suffix string) string {
+func (node *ColName) CompliantName() string {
 	if !node.Qualifier.IsEmpty() {
-		return node.Qualifier.Name.CompliantName() + "_" + node.Name.CompliantName() + suffix
+		return node.Qualifier.Name.CompliantName() + "_" + node.Name.CompliantName()
 	}
-	return node.Name.CompliantName() + suffix
+	return node.Name.CompliantName()
 }
 
 // AtCount represents the '@' count in ColIdent
@@ -1331,314 +1319,23 @@ const (
 	DoubleAt
 )
 
-func nilOrClone(in Expr) Expr {
-	if in == nil {
-		return nil
+// handleUnaryMinus handles the case when a unary minus operator is seen in the parser. It takes 1 argument which is the expr to which the unary minus has been added to.
+func handleUnaryMinus(expr Expr) Expr {
+	if num, ok := expr.(*Literal); ok && num.Type == IntVal {
+		// Handle double negative
+		if num.Val[0] == '-' {
+			num.Val = num.Val[1:]
+			return num
+		}
+		return NewIntLiteral("-" + num.Val)
 	}
-	return in.Clone()
+	if unaryExpr, ok := expr.(*UnaryExpr); ok && unaryExpr.Operator == UMinusOp {
+		return unaryExpr.Expr
+	}
+	return &UnaryExpr{Operator: UMinusOp, Expr: expr}
 }
 
-// Clone implements the Expr interface
-func (node *Subquery) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("Subquery cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *AndExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &AndExpr{
-		Left:  nilOrClone(node.Left),
-		Right: nilOrClone(node.Right),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *OrExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &OrExpr{
-		Left:  nilOrClone(node.Left),
-		Right: nilOrClone(node.Right),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *XorExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &XorExpr{
-		Left:  nilOrClone(node.Left),
-		Right: nilOrClone(node.Right),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *NotExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &NotExpr{
-		Expr: nilOrClone(node),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *ComparisonExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &ComparisonExpr{
-		Operator: node.Operator,
-		Left:     nilOrClone(node.Left),
-		Right:    nilOrClone(node.Right),
-		Escape:   nilOrClone(node.Escape),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *RangeCond) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &RangeCond{
-		Operator: node.Operator,
-		Left:     nilOrClone(node.Left),
-		From:     nilOrClone(node.From),
-		To:       nilOrClone(node.To),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *IsExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &IsExpr{
-		Operator: node.Operator,
-		Expr:     nilOrClone(node.Expr),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *ExistsExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &ExistsExpr{
-		Subquery: nilOrClone(node.Subquery).(*Subquery),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *Literal) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &Literal{}
-}
-
-// Clone implements the Expr interface
-func (node Argument) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	cpy := make(Argument, len(node))
-	copy(cpy, node)
-	return cpy
-}
-
-// Clone implements the Expr interface
-func (node *NullVal) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &NullVal{}
-}
-
-// Clone implements the Expr interface
-func (node BoolVal) Clone() Expr {
-	return node
-}
-
-// Clone implements the Expr interface
-func (node *ColName) Clone() Expr {
-	return node
-}
-
-// Clone implements the Expr interface
-func (node ValTuple) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	cpy := make(ValTuple, len(node))
-	copy(cpy, node)
-	return cpy
-}
-
-// Clone implements the Expr interface
-func (node ListArg) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	cpy := make(ListArg, len(node))
-	copy(cpy, node)
-	return cpy
-}
-
-// Clone implements the Expr interface
-func (node *BinaryExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &BinaryExpr{
-		Operator: node.Operator,
-		Left:     nilOrClone(node.Left),
-		Right:    nilOrClone(node.Right),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *UnaryExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &UnaryExpr{
-		Operator: node.Operator,
-		Expr:     nilOrClone(node.Expr),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *IntervalExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &IntervalExpr{
-		Expr: nilOrClone(node.Expr),
-		Unit: node.Unit,
-	}
-}
-
-// Clone implements the Expr interface
-func (node *CollateExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &CollateExpr{
-		Expr:    nilOrClone(node.Expr),
-		Charset: node.Charset,
-	}
-}
-
-// Clone implements the Expr interface
-func (node *FuncExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("FuncExpr cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *TimestampFuncExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &TimestampFuncExpr{
-		Name:  node.Name,
-		Expr1: nilOrClone(node.Expr1),
-		Expr2: nilOrClone(node.Expr2),
-		Unit:  node.Unit,
-	}
-}
-
-// Clone implements the Expr interface
-func (node *CurTimeFuncExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &CurTimeFuncExpr{
-		Name: node.Name,
-		Fsp:  nilOrClone(node.Fsp),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *CaseExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("CaseExpr cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *ValuesFuncExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &ValuesFuncExpr{
-		Name: nilOrClone(node.Name).(*ColName),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *ConvertExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("ConvertExpr cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *SubstrExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &SubstrExpr{
-		Name:   node.Name,
-		StrVal: nilOrClone(node.StrVal).(*Literal),
-		From:   nilOrClone(node.From),
-		To:     nilOrClone(node.To),
-	}
-}
-
-// Clone implements the Expr interface
-func (node *ConvertUsingExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &ConvertUsingExpr{
-		Expr: nilOrClone(node.Expr),
-		Type: node.Type,
-	}
-}
-
-// Clone implements the Expr interface
-func (node *MatchExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("MatchExpr cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *GroupConcatExpr) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	panic("GroupConcatExpr cloning not supported")
-}
-
-// Clone implements the Expr interface
-func (node *Default) Clone() Expr {
-	if node == nil {
-		return nil
-	}
-	return &Default{ColName: node.ColName}
+// encodeSQLString encodes the string as a SQL string.
+func encodeSQLString(val string) string {
+	return sqltypes.EncodeStringSQL(val)
 }

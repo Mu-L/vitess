@@ -18,9 +18,7 @@ package planbuilder
 
 import (
 	"vitess.io/vitess/go/vt/key"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
@@ -36,8 +34,8 @@ func buildCallProcPlan(stmt *sqlparser.CallProc, vschema ContextVSchema) (engine
 	}
 
 	if dest == nil {
-		if keyspace.Sharded {
-			return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, errNotAllowWhenSharded)
+		if err := vschema.ErrorIfShardedF(keyspace, "CALL", errNotAllowWhenSharded); err != nil {
+			return nil, err
 		}
 		dest = key.DestinationAnyShard{}
 	}
@@ -51,4 +49,4 @@ func buildCallProcPlan(stmt *sqlparser.CallProc, vschema ContextVSchema) (engine
 	}, nil
 }
 
-const errNotAllowWhenSharded = "CALL is only allowed for targeted queries or on unsharded keyspaces"
+const errNotAllowWhenSharded = "CALL is not supported for sharded database"

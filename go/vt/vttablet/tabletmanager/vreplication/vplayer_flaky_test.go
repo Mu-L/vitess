@@ -25,6 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql"
+
 	"github.com/spyzhov/ajson"
 	"github.com/stretchr/testify/require"
 
@@ -37,6 +39,40 @@ import (
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
+
+func TestHeartbeatFrequencyFlag(t *testing.T) {
+	origVReplicationHeartbeatUpdateInterval := *vreplicationHeartbeatUpdateInterval
+	defer func() {
+		*vreplicationHeartbeatUpdateInterval = origVReplicationHeartbeatUpdateInterval
+	}()
+
+	stats := binlogplayer.NewStats()
+	vp := &vplayer{vr: &vreplicator{dbClient: newVDBClient(realDBClientFactory(), stats), stats: stats}}
+
+	type testcount struct {
+		count      int
+		mustUpdate bool
+	}
+	type testcase struct {
+		name     string
+		interval int
+		counts   []testcount
+	}
+	testcases := []*testcase{
+		{"default frequency", 1, []testcount{{count: 0, mustUpdate: false}, {1, true}}},
+		{"custom frequency", 4, []testcount{{count: 0, mustUpdate: false}, {count: 3, mustUpdate: false}, {4, true}}},
+		{"minumum frequency", 61, []testcount{{count: 59, mustUpdate: false}, {count: 60, mustUpdate: true}, {61, true}}},
+	}
+	for _, tcase := range testcases {
+		t.Run(tcase.name, func(t *testing.T) {
+			*vreplicationHeartbeatUpdateInterval = tcase.interval
+			for _, tcount := range tcase.counts {
+				vp.numAccumulatedHeartbeats = tcount.count
+				require.Equal(t, tcount.mustUpdate, vp.mustUpdateCurrentTime())
+			}
+		})
+	}
+}
 
 func TestVReplicationTimeUpdated(t *testing.T) {
 	ctx := context.Background()
@@ -148,14 +184,14 @@ func TestCharPK(t *testing.T) {
 		data   [][]string
 	}{{ //binary(2)
 		input:  "insert into t1 values(1, 'a')",
-		output: "insert into t1(id,val) values (1,'a')",
+		output: "insert into t1(id,val) values (1,'a\\0')",
 		table:  "t1",
 		data: [][]string{
 			{"1", "a\000"},
 		},
 	}, {
 		input:  "update t1 set id = 2 where val = 'a\000'",
-		output: "update t1 set id=2 where val=cast('a' as binary(2))",
+		output: "update t1 set id=2 where val='a\\0'",
 		table:  "t1",
 		data: [][]string{
 			{"2", "a\000"},
@@ -218,6 +254,7 @@ func TestCharPK(t *testing.T) {
 		}
 	}
 }
+
 func TestRollup(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
@@ -1270,7 +1307,16 @@ func TestPlayerRowMove(t *testing.T) {
 
 func TestPlayerTypes(t *testing.T) {
 	log.Errorf("TestPlayerTypes: flavor is %s", env.Flavor)
-
+	enableJSONColumnTesting := false
+	flavor := strings.ToLower(env.Flavor)
+	// Disable tests on percona (which identifies as mysql56) and mariadb platforms in CI since they
+	// either don't support JSON or JSON support is not enabled by default
+	if strings.Contains(flavor, "mysql57") || strings.Contains(flavor, "mysql80") {
+		log.Infof("Running JSON column type tests on flavor %s", flavor)
+		enableJSONColumnTesting = true
+	} else {
+		log.Warningf("Not running JSON column type tests on flavor %s", flavor)
+	}
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
@@ -1278,8 +1324,8 @@ func TestPlayerTypes(t *testing.T) {
 		fmt.Sprintf("create table %s.vitess_ints(tiny tinyint, tinyu tinyint unsigned, small smallint, smallu smallint unsigned, medium mediumint, mediumu mediumint unsigned, normal int, normalu int unsigned, big bigint, bigu bigint unsigned, y year, primary key(tiny))", vrepldb),
 		"create table vitess_fracts(id int, deci decimal(5,2), num numeric(5,2), f float, d double, primary key(id))",
 		fmt.Sprintf("create table %s.vitess_fracts(id int, deci decimal(5,2), num numeric(5,2), f float, d double, primary key(id))", vrepldb),
-		"create table vitess_strings(vb varbinary(16), c char(16), vc varchar(16), b binary(4), tb tinyblob, bl blob, ttx tinytext, tx text, en enum('a','b'), s set('a','b'), primary key(vb))",
-		fmt.Sprintf("create table %s.vitess_strings(vb varbinary(16), c char(16), vc varchar(16), b binary(4), tb tinyblob, bl blob, ttx tinytext, tx text, en enum('a','b'), s set('a','b'), primary key(vb))", vrepldb),
+		"create table vitess_strings(vb varbinary(16), c char(16), vc varchar(16), b binary(5), tb tinyblob, bl blob, ttx tinytext, tx text, en enum('a','b'), s set('a','b'), primary key(vb))",
+		fmt.Sprintf("create table %s.vitess_strings(vb varbinary(16), c char(16), vc varchar(16), b binary(5), tb tinyblob, bl blob, ttx tinytext, tx text, en enum('a','b'), s set('a','b'), primary key(vb))", vrepldb),
 		"create table vitess_misc(id int, b bit(8), d date, dt datetime, t time, g geometry, primary key(id))",
 		fmt.Sprintf("create table %s.vitess_misc(id int, b bit(8), d date, dt datetime, t time, g geometry, primary key(id))", vrepldb),
 		"create table vitess_null(id int, val varbinary(128), primary key(id))",
@@ -1303,7 +1349,7 @@ func TestPlayerTypes(t *testing.T) {
 		"drop table binary_pk",
 		fmt.Sprintf("drop table %s.binary_pk", vrepldb),
 	})
-	if strings.Contains(env.Flavor, "mysql57") {
+	if enableJSONColumnTesting {
 		execStatements(t, []string{
 			"create table vitess_json(id int auto_increment, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))",
 			fmt.Sprintf("create table %s.vitess_json(id int, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))", vrepldb),
@@ -1351,10 +1397,10 @@ func TestPlayerTypes(t *testing.T) {
 		},
 	}, {
 		input:  "insert into vitess_strings values('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'a', 'a,b')",
-		output: "insert into vitess_strings(vb,c,vc,b,tb,bl,ttx,tx,en,s) values ('a','b','c','d','e','f','g','h','1','3')",
+		output: "insert into vitess_strings(vb,c,vc,b,tb,bl,ttx,tx,en,s) values ('a','b','c','d\\0\\0\\0\\0','e','f','g','h','1','3')",
 		table:  "vitess_strings",
 		data: [][]string{
-			{"a", "b", "c", "d\000\000\000", "e", "f", "g", "h", "a", "a,b"},
+			{"a", "b", "c", "d\000\000\000\000", "e", "f", "g", "h", "a", "a,b"},
 		},
 	}, {
 		input:  "insert into vitess_misc values(1, '\x01', '2012-01-01', '2012-01-01 15:45:45', '15:45:45', point(1, 2))",
@@ -1372,7 +1418,7 @@ func TestPlayerTypes(t *testing.T) {
 		},
 	}, {
 		input:  "insert into binary_pk values('a', 'aaa')",
-		output: "insert into binary_pk(b,val) values ('a','aaa')",
+		output: "insert into binary_pk(b,val) values ('a\\0\\0\\0','aaa')",
 		table:  "binary_pk",
 		data: [][]string{
 			{"a\000\000\000", "aaa"},
@@ -1380,14 +1426,13 @@ func TestPlayerTypes(t *testing.T) {
 	}, {
 		// Binary pk is a special case: https://github.com/vitessio/vitess/issues/3984
 		input:  "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
-		output: "update binary_pk set val='bbb' where b=cast('a' as binary(4))",
+		output: "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
 		table:  "binary_pk",
 		data: [][]string{
-			{"a\x00\x00\x00", "bbb"},
+			{"a\000\000\000", "bbb"},
 		},
 	}}
-
-	if strings.Contains(env.Flavor, "mysql57") {
+	if enableJSONColumnTesting {
 		testcases = append(testcases, testcase{
 			input: "insert into vitess_json(val1,val2,val3,val4,val5) values (null,'{}','123','{\"a\":[42,100]}', '{\"foo\":\"bar\"}')",
 			output: "insert into vitess_json(id,val1,val2,val3,val4,val5) values (1," +
@@ -1396,6 +1441,14 @@ func TestPlayerTypes(t *testing.T) {
 			table: "vitess_json",
 			data: [][]string{
 				{"1", "", "{}", "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
+			},
+		})
+		testcases = append(testcases, testcase{
+			input:  "update vitess_json set val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4)",
+			output: "update vitess_json set val1=convert(null using utf8mb4), val2=convert('{}' using utf8mb4), val3=convert('123' using utf8mb4), val4=convert('{\\\"a\\\":[98,123]}' using utf8mb4), val5=convert('{}' using utf8mb4) where id=1",
+			table:  "vitess_json",
+			data: [][]string{
+				{"1", "", "{}", "123", `{"a": [98, 123]}`, `{}`},
 			},
 		})
 	}
@@ -1547,9 +1600,62 @@ func TestPlayerDDL(t *testing.T) {
 	cancel()
 }
 
+func TestGTIDCompress(t *testing.T) {
+	ctx := context.Background()
+	defer deleteTablet(addTablet(100))
+	err := env.Mysqld.ExecuteSuperQuery(ctx, "insert into _vt.vreplication (id, workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state,db_name) values (1, '', '', '', 0,0,0,0,'Stopped','')")
+	require.NoError(t, err)
+
+	type testCase struct {
+		name, gtid string
+		compress   bool
+	}
+
+	testCases := []testCase{
+		{"cleartext1", "MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-308092", false},
+		{"cleartext2", "MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-308092,320a5e98-6965-11ea-b949-eeafd34ae6e4:1-3,81cbdbf8-6969-11ea-aeb1-a6143b021f67:1-524891956,c9a0f301-6965-11ea-ba9d-02c229065569:1-3,cb698dac-6969-11ea-ac38-16e5d0ac5c3a:1-524441991,e39fca4d-6960-11ea-b4c2-1e895fd49fa0:1-3", false},
+		{"compress1", "MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-308092", true},
+		{"compress2", "MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-308092,320a5e98-6965-11ea-b949-eeafd34ae6e4:1-3,81cbdbf8-6969-11ea-aeb1-a6143b021f67:1-524891956,c9a0f301-6965-11ea-ba9d-02c229065569:1-3,cb698dac-6969-11ea-ac38-16e5d0ac5c3a:1-524441991,e39fca4d-6960-11ea-b4c2-1e895fd49fa0:1-3", true},
+		{"nil-compress", "", true},
+		{"nil-clear", "", false},
+	}
+	for _, tCase := range testCases {
+		t.Run(tCase.name, func(t *testing.T) {
+			strGTID := fmt.Sprintf("'%s'", tCase.gtid)
+			if tCase.compress {
+				strGTID = fmt.Sprintf("compress(%s)", strGTID)
+			}
+			err := env.Mysqld.ExecuteSuperQuery(ctx, fmt.Sprintf("update _vt.vreplication set pos=%s where id = 1", strGTID))
+			require.NoError(t, err)
+			qr, err := env.Mysqld.FetchSuperQuery(ctx, "select pos from _vt.vreplication where id = 1")
+			require.NoError(t, err)
+			require.NotNil(t, qr)
+			require.Equal(t, 1, len(qr.Rows))
+			gotGTID := qr.Rows[0][0].ToString()
+			pos, err := mysql.DecodePosition(gotGTID)
+			if tCase.compress {
+				require.True(t, pos.IsZero())
+				pos, err = binlogplayer.DecodePosition(gotGTID)
+				require.NoError(t, err)
+				require.NotNil(t, pos)
+				tpos, err := mysql.DecodePosition(tCase.gtid)
+				require.NoError(t, err)
+				require.Equal(t, tpos.String(), pos.String())
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, pos)
+				require.Equal(t, tCase.gtid, gotGTID)
+			}
+		})
+	}
+}
+
 func TestPlayerStopPos(t *testing.T) {
 	defer deleteTablet(addTablet(100))
-
+	*vreplicationStoreCompressedGTID = true
+	defer func() {
+		*vreplicationStoreCompressedGTID = false
+	}()
 	execStatements(t, []string{
 		"create table yes(id int, val varbinary(128), primary key(id))",
 		fmt.Sprintf("create table %s.yes(id int, val varbinary(128), primary key(id))", vrepldb),
@@ -1602,7 +1708,7 @@ func TestPlayerStopPos(t *testing.T) {
 		"/update.*'Running'",
 		"begin",
 		"insert into yes(id,val) values (1,'aaa')",
-		fmt.Sprintf("/update.*'%s'", stopPos),
+		fmt.Sprintf("/update.*compress.*'%s'", stopPos),
 		"/update.*'Stopped'",
 		"commit",
 	})
@@ -2403,6 +2509,32 @@ func TestPlayerJSONDocs(t *testing.T) {
 			expectDBClientQueries(t, want)
 			expectJSON(t, "vitess_json", tcase.data, id, env.Mysqld.FetchSuperQuery)
 		})
+	}
+}
+
+func TestVReplicationLogs(t *testing.T) {
+	defer deleteTablet(addTablet(100))
+	dbClient := playerEngine.dbClientFactoryDba()
+	err := dbClient.Connect()
+	require.NoError(t, err)
+	defer dbClient.Close()
+	vdbc := newVDBClient(dbClient, binlogplayer.NewStats())
+	query := "select vrepl_id, state, message, count from _vt.vreplication_log order by id desc limit 1"
+
+	expected := []string{
+		"[[INT32(1) VARBINARY(\"Running\") TEXT(\"message1\") INT64(1)]]",
+		"[[INT32(1) VARBINARY(\"Running\") TEXT(\"message1\") INT64(2)]]",
+	}
+
+	for _, want := range expected {
+		t.Run("", func(t *testing.T) {
+			err = insertLog(vdbc, LogMessage, 1, "Running", "message1")
+			require.NoError(t, err)
+			qr, err := env.Mysqld.FetchSuperQuery(context.Background(), query)
+			require.NoError(t, err)
+			require.Equal(t, want, fmt.Sprintf("%v", qr.Rows))
+		})
+
 	}
 }
 

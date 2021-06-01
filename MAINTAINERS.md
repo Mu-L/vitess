@@ -4,7 +4,8 @@ The following is the full list, alphabetically ordered.
 
 * Alkin Tezuysal ([askdba](https://github.com/askdba)) alkin@planetscale.com
 * Andres Taylor ([systay](https://github.com/systay)) andres@planetscale.com
-* Anthony Yeh ([enisoc](https://github.com/enisoc)) enisoc@planetscale.com
+* Andrew Mason ([amason](https://github.com/ajm188)) amason@slack-corp.com
+* Anthony Yeh ([enisoc](https://github.com/enisoc)) enisoc@enisoc.dev
 * Dan Kozlowski ([dkhenry](https://github.com/dkhenry)) dan.kozlowski@gmail.com
 * David Weitzman ([dweitzman](https://github.com/dweitzman)) dweitzman@pinterest.com
 * Deepthi Sigireddi ([deepthi](https://github.com/deepthi)) deepthi@planetscale.com
@@ -18,6 +19,7 @@ The following is the full list, alphabetically ordered.
 * Rohit Nayak ([rohit-nayak-ps](https://github.com/rohit-nayak-ps)) rohit@planetscale.com
 * Shlomi Noach ([shlomi-noach](https://github.com/shlomi-noach)) shlomi@planetscale.com
 * Sugu Sougoumarane ([sougou](https://github.com/sougou)) sougou@planetscale.com
+* Vicent Marti ([vmg])(https://github.com/vmg)) vmg@planetscale.com
 
 ## Areas of expertise
 
@@ -25,7 +27,7 @@ The following is the full list, alphabetically ordered.
 sougou, demmer, rafael, dweitzman, tirsen, askdba, enisoc
 
 ### Builds
-dkhenry, shlomi-noach
+dkhenry, shlomi-noach, ajm188, vmg
 
 ### Resharding
 sougou, rafael, tirsen, dweitzman, systay, rohit-nayak-ps
@@ -33,11 +35,17 @@ sougou, rafael, tirsen, dweitzman, systay, rohit-nayak-ps
 ### Parser
 sougou, dweitzman, deepthi, systay, harshit-gangal
 
+### Performance
+vmg
+
 ### Cluster Management
-deepthi, rafael, enisoc, shlomi-noach
+deepthi, rafael, enisoc, shlomi-noach, ajm188
 
 ### Java
 mpawliszyn, pH14, harshit-gangal
 
 ### Kubernetes
 derekperkins, dkhenry, enisoc
+
+### VTAdmin
+ajm188

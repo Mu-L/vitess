@@ -38,7 +38,7 @@ func transformToLogicalPlan(tree joinTree, semTable *semantics.SemTable) (logica
 		return transformJoinPlan(n, semTable)
 	}
 
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unknown type encountered: %T", tree)
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unknown type encountered: %T", tree)
 }
 
 func transformJoinPlan(n *joinPlan, semTable *semantics.SemTable) (logicalPlan, error) {
@@ -74,6 +74,15 @@ func transformRoutePlan(n *routePlan) (*route, error) {
 		}
 		tablesForSelect = append(tablesForSelect, &alias)
 		tableNameMap[sqlparser.String(t.qtable.table.Name)] = nil
+	}
+
+	for _, predicate := range n.vindexPredicates {
+		switch predicate := predicate.(type) {
+		case *sqlparser.ComparisonExpr:
+			if predicate.Operator == sqlparser.InOp {
+				predicate.Right = sqlparser.ListArg(engine.ListVarName)
+			}
+		}
 	}
 
 	predicates := n.Predicates()

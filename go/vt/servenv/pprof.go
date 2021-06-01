@@ -19,8 +19,10 @@ package servenv
 import (
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"vitess.io/vitess/go/vt/log"
 )
@@ -55,10 +58,11 @@ func (p profmode) filename() string {
 }
 
 type profile struct {
-	mode  profmode
-	rate  int
-	path  string
-	quiet bool
+	mode    profmode
+	rate    int
+	path    string
+	quiet   bool
+	waitSig bool
 }
 
 func parseProfileFlag(pf string) (*profile, error) {
@@ -124,6 +128,15 @@ func parseProfileFlag(pf string) (*profile, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid quiet flag %q: %v", fields[1], err)
 			}
+		case "waitSig":
+			if len(fields) == 1 {
+				p.waitSig = true
+				continue
+			}
+			p.waitSig, err = strconv.ParseBool(fields[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid waitSig flag %q: %v", fields[1], err)
+			}
 		default:
 			return nil, fmt.Errorf("unknown flag: %q", fields[0])
 		}
@@ -134,14 +147,25 @@ func parseProfileFlag(pf string) (*profile, error) {
 
 var profileStarted uint32
 
-// start begins the configured profiling process and returns a cleanup function
-// that must be executed before process termination to flush the profile to disk.
-// Based on the profiling code in github.com/pkg/profile
-func (prof *profile) start() func() {
-	if !atomic.CompareAndSwapUint32(&profileStarted, 0, 1) {
-		log.Fatal("profile: Start() already called")
+func startCallback(start func()) func() {
+	return func() {
+		if atomic.CompareAndSwapUint32(&profileStarted, 0, 1) {
+			start()
+		} else {
+			log.Fatal("profile: Start() already called")
+		}
 	}
+}
 
+func stopCallback(stop func()) func() {
+	return func() {
+		if atomic.CompareAndSwapUint32(&profileStarted, 1, 0) {
+			stop()
+		}
+	}
+}
+
+func (prof *profile) mkprofile() io.WriteCloser {
 	var (
 		path string
 		err  error
@@ -169,69 +193,107 @@ func (prof *profile) start() func() {
 	}
 	logf("pprof: %s profiling enabled, %s", string(prof.mode), fn)
 
+	return f
+}
+
+// init returns a start function that begins the configured profiling process and
+// returns a cleanup function that must be executed before process termination to
+// flush the profile to disk.
+// Based on the profiling code in github.com/pkg/profile
+func (prof *profile) init() (start func(), stop func()) {
+	var pf io.WriteCloser
+
 	switch prof.mode {
 	case profileCPU:
-		pprof.StartCPUProfile(f)
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+			pprof.StartCPUProfile(pf)
+		})
+		stop = stopCallback(func() {
 			pprof.StopCPUProfile()
-			f.Close()
-		}
+			pf.Close()
+		})
+		return start, stop
 
 	case profileMemHeap, profileMemAllocs:
 		old := runtime.MemProfileRate
-		runtime.MemProfileRate = prof.rate
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+			runtime.MemProfileRate = prof.rate
+		})
+		stop = stopCallback(func() {
 			tt := "heap"
 			if prof.mode == profileMemAllocs {
 				tt = "allocs"
 			}
-			pprof.Lookup(tt).WriteTo(f, 0)
-			f.Close()
+			pprof.Lookup(tt).WriteTo(pf, 0)
+			pf.Close()
 			runtime.MemProfileRate = old
-		}
+		})
+		return start, stop
 
 	case profileMutex:
-		runtime.SetMutexProfileFraction(prof.rate)
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+			runtime.SetMutexProfileFraction(prof.rate)
+		})
+		stop = stopCallback(func() {
 			if mp := pprof.Lookup("mutex"); mp != nil {
-				mp.WriteTo(f, 0)
+				mp.WriteTo(pf, 0)
 			}
-			f.Close()
+			pf.Close()
 			runtime.SetMutexProfileFraction(0)
-		}
+		})
+		return start, stop
 
 	case profileBlock:
-		runtime.SetBlockProfileRate(prof.rate)
-		return func() {
-			pprof.Lookup("block").WriteTo(f, 0)
-			f.Close()
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+			runtime.SetBlockProfileRate(prof.rate)
+		})
+		stop = stopCallback(func() {
+			pprof.Lookup("block").WriteTo(pf, 0)
+			pf.Close()
 			runtime.SetBlockProfileRate(0)
-		}
+		})
+		return start, stop
 
 	case profileThreads:
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+		})
+		stop = stopCallback(func() {
 			if mp := pprof.Lookup("threadcreate"); mp != nil {
-				mp.WriteTo(f, 0)
+				mp.WriteTo(pf, 0)
 			}
-			f.Close()
-		}
+			pf.Close()
+		})
+		return start, stop
 
 	case profileTrace:
-		if err := trace.Start(f); err != nil {
-			log.Fatalf("pprof: could not start trace: %v", err)
-		}
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+			if err := trace.Start(pf); err != nil {
+				log.Fatalf("pprof: could not start trace: %v", err)
+			}
+		})
+		stop = stopCallback(func() {
 			trace.Stop()
-			f.Close()
-		}
+			pf.Close()
+		})
+		return start, stop
 
 	case profileGoroutine:
-		return func() {
+		start = startCallback(func() {
+			pf = prof.mkprofile()
+		})
+		stop = stopCallback(func() {
 			if mp := pprof.Lookup("goroutine"); mp != nil {
-				mp.WriteTo(f, 0)
+				mp.WriteTo(pf, 0)
 			}
-			f.Close()
-		}
+			pf.Close()
+		})
+		return start, stop
 
 	default:
 		panic("unsupported profile mode")
@@ -245,7 +307,24 @@ func init() {
 			log.Fatal(err)
 		}
 		if prof != nil {
-			stop := prof.start()
+			ch := make(chan os.Signal, 1)
+			signal.Notify(ch, syscall.SIGUSR1)
+			start, stop := prof.init()
+
+			if prof.waitSig {
+				go func() {
+					<-ch
+					start()
+				}()
+			} else {
+				start()
+			}
+
+			go func() {
+				<-ch
+				stop()
+			}()
+
 			OnTerm(stop)
 		}
 	})

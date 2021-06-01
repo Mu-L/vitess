@@ -17,57 +17,73 @@ limitations under the License.
 package testutil
 
 import (
+	"fmt"
+	"sort"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"vitess.io/vitess/go/test/utils"
 
 	vtadminpb "vitess.io/vitess/go/vt/proto/vtadmin"
 )
 
 // AssertKeyspaceSlicesEqual is a convenience function to assert that two
-// []*vtadminpb.Keyspaces slices are equal, after clearing out any reserved
-// proto XXX_ fields.
-func AssertKeyspaceSlicesEqual(t *testing.T, expected []*vtadminpb.Keyspace, actual []*vtadminpb.Keyspace, msgAndArgs ...interface{}) {
+// []*vtadminpb.Keyspaces slices are equal
+func AssertKeyspaceSlicesEqual(t *testing.T, expected []*vtadminpb.Keyspace, actual []*vtadminpb.Keyspace) {
 	t.Helper()
-
 	for _, ks := range [][]*vtadminpb.Keyspace{expected, actual} {
 		for _, k := range ks {
 			if k.Shards != nil {
 				for _, ss := range k.Shards {
-					ss.XXX_sizecache = 0
-					ss.XXX_unrecognized = nil
 					ss.Shard.KeyRange = nil
 				}
 			}
 		}
 	}
-
-	assert.ElementsMatch(t, expected, actual, msgAndArgs...)
+	sort.Slice(expected, func(i, j int) bool {
+		return fmt.Sprintf("%v", expected[i]) < fmt.Sprintf("%v", expected[j])
+	})
+	sort.Slice(actual, func(i, j int) bool {
+		return fmt.Sprintf("%v", actual[i]) < fmt.Sprintf("%v", actual[j])
+	})
+	utils.MustMatch(t, expected, actual)
 }
 
 // AssertSchemaSlicesEqual is a convenience function to assert that two
-// []*vtadminpb.Schema slices are equal, after clearing out any reserved
-// proto XXX_ fields.
-func AssertSchemaSlicesEqual(t *testing.T, expected []*vtadminpb.Schema, actual []*vtadminpb.Schema, msgAndArgs ...interface{}) {
+// []*vtadminpb.Schema slices are equal
+func AssertSchemaSlicesEqual(t *testing.T, expected []*vtadminpb.Schema, actual []*vtadminpb.Schema) {
+	t.Helper()
+	sort.Slice(expected, func(i, j int) bool {
+		return fmt.Sprintf("%v", expected[i]) < fmt.Sprintf("%v", expected[j])
+	})
+	sort.Slice(actual, func(i, j int) bool {
+		return fmt.Sprintf("%v", actual[i]) < fmt.Sprintf("%v", actual[j])
+	})
+	utils.MustMatch(t, expected, actual)
+}
+
+// AssertSrvVSchemaSlicesEqual is a convenience function to assert that two
+// []*vtadminpb.SrvVSchema slices are equal
+func AssertSrvVSchemaSlicesEqual(t *testing.T, expected []*vtadminpb.SrvVSchema, actual []*vtadminpb.SrvVSchema) {
 	t.Helper()
 
-	for _, ss := range [][]*vtadminpb.Schema{expected, actual} {
-		for _, s := range ss {
-			if s.TableDefinitions != nil {
-				for _, td := range s.TableDefinitions {
-					td.XXX_sizecache = 0
-					td.XXX_unrecognized = nil
+	sort.Slice(expected, func(i, j int) bool {
+		return fmt.Sprintf("%v", expected[i]) < fmt.Sprintf("%v", expected[j])
+	})
+	sort.Slice(actual, func(i, j int) bool {
+		return fmt.Sprintf("%v", actual[i]) < fmt.Sprintf("%v", actual[j])
+	})
+	utils.MustMatch(t, expected, actual)
+}
 
-					if td.Fields != nil {
-						for _, f := range td.Fields {
-							f.XXX_sizecache = 0
-							f.XXX_unrecognized = nil
-						}
-					}
-				}
-			}
-		}
-	}
-
-	assert.ElementsMatch(t, expected, actual, msgAndArgs...)
+// AssertTabletSlicesEqual is a convenience function to assert that two
+// []*vtadminpb.Tablet slices are equal
+func AssertTabletSlicesEqual(t *testing.T, expected []*vtadminpb.Tablet, actual []*vtadminpb.Tablet) {
+	t.Helper()
+	sort.Slice(expected, func(i, j int) bool {
+		return fmt.Sprintf("%v", expected[i]) < fmt.Sprintf("%v", expected[j])
+	})
+	sort.Slice(actual, func(i, j int) bool {
+		return fmt.Sprintf("%v", actual[i]) < fmt.Sprintf("%v", actual[j])
+	})
+	utils.MustMatch(t, expected, actual)
 }

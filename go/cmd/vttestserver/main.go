@@ -23,10 +23,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
 
 	"vitess.io/vitess/go/vt/log"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
@@ -80,6 +82,16 @@ func init() {
 			" The rest of the vitess components are not started."+
 			" Also, the output specifies the mysql unix socket"+
 			" instead of the vtgate port.")
+
+	flag.BoolVar(&config.PersistentMode, "persistent_mode", false,
+		"If this flag is set, the MySQL data directory is not cleaned up"+
+			" when LocalCluster.TearDown() is called. This is useful for running"+
+			" vttestserver as a database container in local developer environments. Note"+
+			" that db migration files (-schema_dir option) and seeding of"+
+			" random data (-initialize_with_random_data option) will only run during"+
+			" cluster startup if the data directory does not already exist. vschema"+
+			" migrations are run every time the cluster starts, since persistence"+
+			" for the topology server has not been implemented yet")
 
 	flag.BoolVar(&doSeed, "initialize_with_random_data", false,
 		"If this flag is each table-shard will be initialized"+
@@ -135,6 +147,10 @@ func init() {
 	flag.BoolVar(&config.InitWorkflowManager, "workflow_manager_init", false, "Enable workflow manager")
 
 	flag.StringVar(&config.VSchemaDDLAuthorizedUsers, "vschema_ddl_authorized_users", "", "Comma separated list of users authorized to execute vschema ddl operations via vtgate")
+
+	flag.StringVar(&config.ForeignKeyMode, "foreign_key_mode", "allow", "This is to provide how to handle foreign key constraint in create/alter table. Valid values are: allow, disallow")
+	flag.BoolVar(&config.EnableOnlineDDL, "enable_online_ddl", true, "Allow users to submit, review and control Online DDL")
+	flag.BoolVar(&config.EnableDirectDDL, "enable_direct_ddl", true, "Allow users to submit direct DDL statements")
 }
 
 func (t *topoFlags) buildTopology() (*vttestpb.VTTestTopology, error) {
@@ -196,7 +212,7 @@ func parseFlags() (env vttest.Environment, err error) {
 		}
 	} else {
 		var topology vttestpb.VTTestTopology
-		err = proto.UnmarshalText(protoTopo, &topology)
+		err = prototext.Unmarshal([]byte(protoTopo), &topology)
 		if err != nil {
 			return
 		}
@@ -229,7 +245,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	select {}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 }
 
 func runCluster() (vttest.LocalCluster, error) {

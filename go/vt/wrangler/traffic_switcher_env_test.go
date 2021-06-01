@@ -220,7 +220,7 @@ func newTestTableMigraterCustom(ctx context.Context, t *testing.T, sourceShards,
 		)
 	}
 
-	if err := tme.wr.saveRoutingRules(ctx, map[string][]string{
+	if err := topotools.SaveRoutingRules(ctx, tme.wr.ts, map[string][]string{
 		"t1":     {"ks1.t1"},
 		"ks2.t1": {"ks1.t1"},
 		"t2":     {"ks1.t2"},
@@ -387,7 +387,7 @@ func (tme *testMigraterEnv) createDBClients(ctx context.Context, t *testing.T) {
 		tme.dbSourceClients = append(tme.dbSourceClients, dbclient)
 		dbClientFactory := func() binlogplayer.DBClient { return dbclient }
 		// Replace existing engine with a new one
-		master.TM.VREngine = vreplication.NewTestEngine(tme.ts, "", master.FakeMysqlDaemon, dbClientFactory, dbclient.DBName(), nil)
+		master.TM.VREngine = vreplication.NewTestEngine(tme.ts, "", master.FakeMysqlDaemon, dbClientFactory, dbClientFactory, dbclient.DBName(), nil)
 		master.TM.VREngine.Open(ctx)
 	}
 	for _, master := range tme.targetMasters {
@@ -396,7 +396,7 @@ func (tme *testMigraterEnv) createDBClients(ctx context.Context, t *testing.T) {
 		tme.dbTargetClients = append(tme.dbTargetClients, dbclient)
 		dbClientFactory := func() binlogplayer.DBClient { return dbclient }
 		// Replace existing engine with a new one
-		master.TM.VREngine = vreplication.NewTestEngine(tme.ts, "", master.FakeMysqlDaemon, dbClientFactory, dbclient.DBName(), nil)
+		master.TM.VREngine = vreplication.NewTestEngine(tme.ts, "", master.FakeMysqlDaemon, dbClientFactory, dbClientFactory, dbclient.DBName(), nil)
 		master.TM.VREngine.Open(ctx)
 	}
 	tme.allDBClients = append(tme.dbSourceClients, tme.dbTargetClients...)

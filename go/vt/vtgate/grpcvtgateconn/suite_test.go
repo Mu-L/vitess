@@ -28,9 +28,10 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
 	"context"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -116,7 +117,8 @@ func (f *fakeVTGateService) Execute(ctx context.Context, session *vtgatepb.Sessi
 		return session, nil, nil
 	}
 	if execCase.outSession != nil {
-		*session = *execCase.outSession
+		proto.Reset(session)
+		proto.Merge(session, execCase.outSession)
 	}
 	return session, execCase.result, nil
 }
@@ -144,7 +146,8 @@ func (f *fakeVTGateService) ExecuteBatch(ctx context.Context, session *vtgatepb.
 		return session, nil, nil
 	}
 	if execCase.outSession != nil {
-		*session = *execCase.outSession
+		proto.Reset(session)
+		proto.Merge(session, execCase.outSession)
 	}
 	return session, []sqltypes.QueryResponse{{
 		QueryResult: execCase.result,
@@ -212,7 +215,7 @@ func (f *fakeVTGateService) ResolveTransaction(ctx context.Context, dtid string)
 	return nil
 }
 
-func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
+func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags, send func([]*binlogdatapb.VEvent) error) error {
 	panic("unimplemented")
 }
 

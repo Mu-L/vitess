@@ -17,28 +17,26 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
-	"vitess.io/vitess/go/test/utils"
-
 	"github.com/stretchr/testify/assert"
-
-	"context"
-
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/vterrors"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/srvtopo"
-	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // This file uses the sandbox_test framework.
@@ -153,11 +151,11 @@ func TestScatterConnStreamExecuteMulti(t *testing.T) {
 		}
 		bvs := make([]map[string]*querypb.BindVariable, len(rss))
 		qr := new(sqltypes.Result)
-		err = sc.StreamExecuteMulti(ctx, "query", rss, bvs, nil, func(r *sqltypes.Result) error {
+		errors := sc.StreamExecuteMulti(ctx, "query", rss, bvs, nil, func(r *sqltypes.Result) error {
 			qr.AppendResult(r)
 			return nil
 		})
-		return qr, err
+		return qr, vterrors.Aggregate(errors)
 	})
 }
 
@@ -165,12 +163,8 @@ func TestScatterConnStreamExecuteMulti(t *testing.T) {
 // type, and error code.
 func verifyScatterConnError(t *testing.T, err error, wantErr string, wantCode vtrpcpb.Code) {
 	t.Helper()
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("wanted error: %s, got error: %v", wantErr, err)
-	}
-	if code := vterrors.Code(err); code != wantCode {
-		t.Errorf("wanted error code: %s, got: %v", wantCode, code)
-	}
+	assert.EqualError(t, err, wantErr)
+	assert.Equal(t, wantCode, vterrors.Code(err))
 }
 
 func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, shards []string) (*sqltypes.Result, error)) {
@@ -191,7 +185,7 @@ func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, s
 	sbc := hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
 	_, err = f(sc, []string{"0"})
-	want := fmt.Sprintf("target: %v.0.replica, used tablet: aa-0 (0): INVALID_ARGUMENT error", name)
+	want := fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error", name)
 	// Verify server error string.
 	if err == nil || err.Error() != want {
 		t.Errorf("want %s, got %v", want, err)
@@ -211,7 +205,7 @@ func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, s
 	sbc1.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
 	_, err = f(sc, []string{"0", "1"})
 	// Verify server errors are consolidated.
-	want = fmt.Sprintf("target: %v.0.replica, used tablet: aa-0 (0): INVALID_ARGUMENT error\ntarget: %v.1.replica, used tablet: aa-0 (1): INVALID_ARGUMENT error", name, name)
+	want = fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error\ntarget: %v.1.replica: INVALID_ARGUMENT error", name, name)
 	verifyScatterConnError(t, err, want, vtrpcpb.Code_INVALID_ARGUMENT)
 	// Ensure that we tried only once.
 	if execCount := sbc0.ExecCount.Get(); execCount != 1 {
@@ -231,7 +225,7 @@ func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, s
 	sbc1.MustFailCodes[vtrpcpb.Code_RESOURCE_EXHAUSTED] = 1
 	_, err = f(sc, []string{"0", "1"})
 	// Verify server errors are consolidated.
-	want = fmt.Sprintf("target: %v.0.replica, used tablet: aa-0 (0): INVALID_ARGUMENT error\ntarget: %v.1.replica, used tablet: aa-0 (1): RESOURCE_EXHAUSTED error", name, name)
+	want = fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error\ntarget: %v.1.replica: RESOURCE_EXHAUSTED error", name, name)
 	// We should only surface the higher priority error code
 	verifyScatterConnError(t, err, want, vtrpcpb.Code_INVALID_ARGUMENT)
 	// Ensure that we tried only once.
@@ -316,7 +310,7 @@ func TestMaxMemoryRows(t *testing.T) {
 		err                 string
 	}{
 		{true, ""},
-		{false, "in-memory row count exceeded allowed limit of 3 (errno 1153) (sqlstate HY000)"},
+		{false, "in-memory row count exceeded allowed limit of 3"},
 	}
 
 	for _, test := range testCases {
@@ -391,15 +385,17 @@ func TestMultiExecs(t *testing.T) {
 	rss := []*srvtopo.ResolvedShard{
 		{
 			Target: &querypb.Target{
-				Keyspace: "TestMultiExecs",
-				Shard:    "0",
+				Keyspace:   "TestMultiExecs",
+				Shard:      "0",
+				TabletType: topodatapb.TabletType_REPLICA,
 			},
 			Gateway: sbc0,
 		},
 		{
 			Target: &querypb.Target{
-				Keyspace: "TestMultiExecs",
-				Shard:    "1",
+				Keyspace:   "TestMultiExecs",
+				Shard:      "1",
+				TabletType: topodatapb.TabletType_REPLICA,
 			},
 			Gateway: sbc1,
 		},
@@ -419,7 +415,8 @@ func TestMultiExecs(t *testing.T) {
 		},
 	}
 
-	_, _ = sc.ExecuteMultiShard(ctx, rss, queries, NewSafeSession(nil), false, false)
+	_, err := sc.ExecuteMultiShard(ctx, rss, queries, NewSafeSession(nil), false, false)
+	require.NoError(t, vterrors.Aggregate(err))
 	if len(sbc0.Queries) == 0 || len(sbc1.Queries) == 0 {
 		t.Fatalf("didn't get expected query")
 	}

@@ -145,7 +145,7 @@ func (se *Engine) EnsureConnectionAndDB(tabletType topodatapb.TabletType) error 
 	// We use allprivs instead of DBA because we want db create to fail if we're read-only.
 	conn, err = dbconnpool.NewDBConnection(ctx, se.env.Config().DB.AllPrivsConnector())
 	if err != nil {
-		return vterrors.Wrap(err, "allprivs connection failed")
+		return err
 	}
 	defer conn.Close()
 
@@ -394,7 +394,7 @@ func (se *Engine) reload(ctx context.Context) error {
 }
 
 func (se *Engine) updateInnoDBRowsRead(ctx context.Context, conn *connpool.DBConn) error {
-	readRowsData, err := conn.Exec(ctx, "show status like 'Innodb_rows_read'", 10, false)
+	readRowsData, err := conn.Exec(ctx, mysql.ShowRowsRead, 10, false)
 	if err != nil {
 		return err
 	}

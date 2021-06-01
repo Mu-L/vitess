@@ -24,12 +24,12 @@ import (
 	"context"
 
 	"vitess.io/vitess/go/sync2"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/wrangler"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // TabletExecutor applies schema changes to all tablets.
@@ -41,7 +41,8 @@ type TabletExecutor struct {
 	allowBigSchemaChange bool
 	keyspace             string
 	waitReplicasTimeout  time.Duration
-	ddlStrategy          string
+	ddlStrategySetting   *schema.DDLStrategySetting
+	skipPreflight        bool
 }
 
 // NewTabletExecutor creates a new TabletExecutor instance
@@ -69,11 +70,17 @@ func (exec *TabletExecutor) DisallowBigSchemaChange() {
 
 // SetDDLStrategy applies ddl_strategy from command line flags
 func (exec *TabletExecutor) SetDDLStrategy(ddlStrategy string) error {
-	if _, _, err := schema.ParseDDLStrategy(ddlStrategy); err != nil {
+	ddlStrategySetting, err := schema.ParseDDLStrategy(ddlStrategy)
+	if err != nil {
 		return err
 	}
-	exec.ddlStrategy = ddlStrategy
+	exec.ddlStrategySetting = ddlStrategySetting
 	return nil
+}
+
+// SkipPreflight disables preflight checks
+func (exec *TabletExecutor) SkipPreflight() {
+	exec.skipPreflight = true
 }
 
 // Open opens a connection to the master for every shard.
@@ -117,7 +124,7 @@ func (exec *TabletExecutor) Validate(ctx context.Context, sqls []string) error {
 
 	// We ignore DATABASE-level DDLs here because detectBigSchemaChanges doesn't
 	// look at them anyway.
-	parsedDDLs, _, err := exec.parseDDLs(sqls)
+	parsedDDLs, _, _, err := exec.parseDDLs(sqls)
 	if err != nil {
 		return err
 	}
@@ -130,43 +137,49 @@ func (exec *TabletExecutor) Validate(ctx context.Context, sqls []string) error {
 	return err
 }
 
-func (exec *TabletExecutor) parseDDLs(sqls []string) ([]sqlparser.DDLStatement, []sqlparser.DBDDLStatement, error) {
+func (exec *TabletExecutor) parseDDLs(sqls []string) ([]sqlparser.DDLStatement, []sqlparser.DBDDLStatement, [](*sqlparser.RevertMigration), error) {
 	parsedDDLs := make([]sqlparser.DDLStatement, 0)
 	parsedDBDDLs := make([]sqlparser.DBDDLStatement, 0)
+	revertStatements := make([](*sqlparser.RevertMigration), 0)
 	for _, sql := range sqls {
-		stat, err := sqlparser.Parse(sql)
+		stmt, err := sqlparser.Parse(sql)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse sql: %s, got error: %v", sql, err)
+			return nil, nil, nil, fmt.Errorf("failed to parse sql: %s, got error: %v", sql, err)
 		}
-		switch ddl := stat.(type) {
+		switch stmt := stmt.(type) {
 		case sqlparser.DDLStatement:
-			parsedDDLs = append(parsedDDLs, ddl)
+			parsedDDLs = append(parsedDDLs, stmt)
 		case sqlparser.DBDDLStatement:
-			parsedDBDDLs = append(parsedDBDDLs, ddl)
+			parsedDBDDLs = append(parsedDBDDLs, stmt)
+		case *sqlparser.RevertMigration:
+			revertStatements = append(revertStatements, stmt)
 		default:
 			if len(exec.tablets) != 1 {
-				return nil, nil, fmt.Errorf("non-ddl statements can only be executed for single shard keyspaces: %s", sql)
+				return nil, nil, nil, fmt.Errorf("non-ddl statements can only be executed for single shard keyspaces: %s", sql)
 			}
 		}
 	}
-	return parsedDDLs, parsedDBDDLs, nil
+	return parsedDDLs, parsedDBDDLs, revertStatements, nil
 }
 
 // IsOnlineSchemaDDL returns true if we expect to run a online schema change DDL
-func (exec *TabletExecutor) isOnlineSchemaDDL(ddlStmt sqlparser.DDLStatement) (isOnline bool, strategy schema.DDLStrategy, options string) {
-	switch ddlStmt.GetAction() {
-	case sqlparser.CreateDDLAction, sqlparser.DropDDLAction, sqlparser.AlterDDLAction:
-	default:
-		return false, strategy, options
+func (exec *TabletExecutor) isOnlineSchemaDDL(stmt sqlparser.Statement) (isOnline bool) {
+	switch stmt := stmt.(type) {
+	case sqlparser.DDLStatement:
+		if exec.ddlStrategySetting == nil {
+			return false
+		}
+		if exec.ddlStrategySetting.Strategy.IsDirect() {
+			return false
+		}
+		switch stmt.GetAction() {
+		case sqlparser.CreateDDLAction, sqlparser.DropDDLAction, sqlparser.AlterDDLAction:
+			return true
+		}
+	case *sqlparser.RevertMigration:
+		return true
 	}
-	strategy, options, err := schema.ParseDDLStrategy(exec.ddlStrategy)
-	if err != nil {
-		return false, strategy, options
-	}
-	if strategy.IsDirect() {
-		return false, strategy, options
-	}
-	return true, strategy, options
+	return false
 }
 
 // a schema change that satisfies any following condition is considered
@@ -188,7 +201,7 @@ func (exec *TabletExecutor) detectBigSchemaChanges(ctx context.Context, parsedDD
 		tableWithCount[tableSchema.Name] = tableSchema.RowCount
 	}
 	for _, ddl := range parsedDDLs {
-		if isOnline, _, _ := exec.isOnlineSchemaDDL(ddl); isOnline {
+		if exec.isOnlineSchemaDDL(ddl) {
 			// Since this is an online schema change, there is no need to worry about big changes
 			continue
 		}
@@ -212,6 +225,9 @@ func (exec *TabletExecutor) detectBigSchemaChanges(ctx context.Context, parsedDD
 }
 
 func (exec *TabletExecutor) preflightSchemaChanges(ctx context.Context, sqls []string) error {
+	if exec.skipPreflight {
+		return nil
+	}
 	_, err := exec.wr.TabletManagerClient().PreflightSchema(ctx, exec.tablets[0], sqls)
 	return err
 }
@@ -219,26 +235,47 @@ func (exec *TabletExecutor) preflightSchemaChanges(ctx context.Context, sqls []s
 // executeSQL executes a single SQL statement either as online DDL or synchronously on all tablets.
 // In online DDL case, the query may be exploded into multiple queries during
 func (exec *TabletExecutor) executeSQL(ctx context.Context, sql string, execResult *ExecuteResult) error {
-	stat, err := sqlparser.Parse(sql)
+	stmt, err := sqlparser.Parse(sql)
 	if err != nil {
 		return err
 	}
-	switch stat := stat.(type) {
+	switch stmt := stmt.(type) {
 	case sqlparser.DDLStatement:
-		if isOnlineDDL, strategy, options := exec.isOnlineSchemaDDL(stat); isOnlineDDL {
-			exec.wr.Logger().Infof("Received DDL request. strategy=%+v", strategy)
-			normalizedQueries, err := schema.NormalizeOnlineDDL(sql)
+		if exec.isOnlineSchemaDDL(stmt) {
+			onlineDDLs, err := schema.NewOnlineDDLs(exec.keyspace, sql, stmt, exec.ddlStrategySetting, exec.requestContext)
 			if err != nil {
+				execResult.ExecutorErr = err.Error()
 				return err
 			}
-			for _, normalized := range normalizedQueries {
-				exec.executeOnlineDDL(ctx, execResult, normalized.SQL, normalized.TableName.Name.String(), strategy, options)
+			for _, onlineDDL := range onlineDDLs {
+				if exec.ddlStrategySetting.IsSkipTopo() {
+					exec.executeOnAllTablets(ctx, execResult, onlineDDL.SQL, true)
+					if len(execResult.SuccessShards) > 0 {
+						exec.wr.Logger().Printf("%s\n", onlineDDL.UUID)
+					}
+				} else {
+					exec.executeOnlineDDL(ctx, execResult, onlineDDL)
+				}
 			}
 			return nil
 		}
+	case *sqlparser.RevertMigration:
+		strategySetting := schema.NewDDLStrategySetting(schema.DDLStrategyOnline, exec.ddlStrategySetting.Options)
+		onlineDDL, err := schema.NewOnlineDDL(exec.keyspace, "", sqlparser.String(stmt), strategySetting, exec.requestContext)
+		if err != nil {
+			execResult.ExecutorErr = err.Error()
+			return err
+		}
+		if exec.ddlStrategySetting.IsSkipTopo() {
+			exec.executeOnAllTablets(ctx, execResult, onlineDDL.SQL, true)
+			exec.wr.Logger().Printf("%s\n", onlineDDL.UUID)
+		} else {
+			exec.executeOnlineDDL(ctx, execResult, onlineDDL)
+		}
+		return nil
 	}
 	exec.wr.Logger().Infof("Received DDL request. strategy=%+v", schema.DDLStrategyDirect)
-	exec.executeOnAllTablets(ctx, execResult, sql)
+	exec.executeOnAllTablets(ctx, execResult, sql, false)
 	return nil
 }
 
@@ -291,16 +328,10 @@ func (exec *TabletExecutor) Execute(ctx context.Context, sqls []string) *Execute
 
 // executeOnlineDDL submits an online DDL request; this runs on topo, not on tablets, and is a quick operation.
 func (exec *TabletExecutor) executeOnlineDDL(
-	ctx context.Context, execResult *ExecuteResult, sql string,
-	tableName string, strategy schema.DDLStrategy, options string,
+	ctx context.Context, execResult *ExecuteResult, onlineDDL *schema.OnlineDDL,
 ) {
-	if strategy.IsDirect() {
+	if exec.ddlStrategySetting == nil || exec.ddlStrategySetting.Strategy.IsDirect() {
 		execResult.ExecutorErr = "Not an online DDL strategy"
-		return
-	}
-	onlineDDL, err := schema.NewOnlineDDL(exec.keyspace, tableName, sql, strategy, options, exec.requestContext)
-	if err != nil {
-		execResult.ExecutorErr = err.Error()
 		return
 	}
 	conn, err := exec.wr.TopoServer().ConnForCell(ctx, topo.GlobalCell)
@@ -317,9 +348,7 @@ func (exec *TabletExecutor) executeOnlineDDL(
 }
 
 // executeOnAllTablets runs a query on all tablets, synchronously. This can be a long running operation.
-func (exec *TabletExecutor) executeOnAllTablets(
-	ctx context.Context, execResult *ExecuteResult, sql string,
-) {
+func (exec *TabletExecutor) executeOnAllTablets(ctx context.Context, execResult *ExecuteResult, sql string, viaQueryService bool) {
 	var wg sync.WaitGroup
 	numOfMasterTablets := len(exec.tablets)
 	wg.Add(numOfMasterTablets)
@@ -328,7 +357,7 @@ func (exec *TabletExecutor) executeOnAllTablets(
 	for _, tablet := range exec.tablets {
 		go func(tablet *topodatapb.Tablet) {
 			defer wg.Done()
-			exec.executeOneTablet(ctx, tablet, sql, errChan, successChan)
+			exec.executeOneTablet(ctx, tablet, sql, viaQueryService, errChan, successChan)
 		}(tablet)
 	}
 	wg.Wait()
@@ -367,9 +396,17 @@ func (exec *TabletExecutor) executeOneTablet(
 	ctx context.Context,
 	tablet *topodatapb.Tablet,
 	sql string,
+	viaQueryService bool,
 	errChan chan ShardWithError,
 	successChan chan ShardResult) {
-	result, err := exec.wr.TabletManagerClient().ExecuteFetchAsDba(ctx, tablet, false, []byte(sql), 10, false, true)
+
+	var result *querypb.QueryResult
+	var err error
+	if viaQueryService {
+		result, err = exec.wr.TabletManagerClient().ExecuteQuery(ctx, tablet, []byte(sql), 10)
+	} else {
+		result, err = exec.wr.TabletManagerClient().ExecuteFetchAsDba(ctx, tablet, false, []byte(sql), 10, false, true)
+	}
 	if err != nil {
 		errChan <- ShardWithError{Shard: tablet.Shard, Err: err.Error()}
 		return

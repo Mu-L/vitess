@@ -20,6 +20,8 @@ package tabletservermock
 import (
 	"sync"
 
+	"google.golang.org/protobuf/proto"
+
 	"context"
 
 	"time"
@@ -28,11 +30,11 @@ import (
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/vttablet/onlineddl"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/vexec"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -72,7 +74,7 @@ type Controller struct {
 	// Set at construction time.
 	StateChanges chan *StateChange
 
-	target querypb.Target
+	target *querypb.Target
 
 	// SetServingTypeError is the return value for SetServingType.
 	SetServingTypeError error
@@ -124,11 +126,11 @@ func (tqsc *Controller) AddStatusPart() {
 }
 
 // InitDBConfig is part of the tabletserver.Controller interface
-func (tqsc *Controller) InitDBConfig(target querypb.Target, dbcfgs *dbconfigs.DBConfigs, _ mysqlctl.MysqlDaemon) error {
+func (tqsc *Controller) InitDBConfig(target *querypb.Target, dbcfgs *dbconfigs.DBConfigs, _ mysqlctl.MysqlDaemon) error {
 	tqsc.mu.Lock()
 	defer tqsc.mu.Unlock()
 
-	tqsc.target = target
+	tqsc.target = proto.Clone(target).(*querypb.Target)
 	return nil
 }
 
@@ -158,11 +160,10 @@ func (tqsc *Controller) IsServing() bool {
 }
 
 // CurrentTarget returns the current target.
-func (tqsc *Controller) CurrentTarget() querypb.Target {
+func (tqsc *Controller) CurrentTarget() *querypb.Target {
 	tqsc.mu.Lock()
 	defer tqsc.mu.Unlock()
-
-	return tqsc.target
+	return proto.Clone(tqsc.target).(*querypb.Target)
 }
 
 // IsHealthy is part of the tabletserver.Controller interface
@@ -176,7 +177,7 @@ func (tqsc *Controller) ReloadSchema(ctx context.Context) error {
 }
 
 // OnlineDDLExecutor is part of the tabletserver.Controller interface
-func (tqsc *Controller) OnlineDDLExecutor() *onlineddl.Executor {
+func (tqsc *Controller) OnlineDDLExecutor() vexec.Executor {
 	return nil
 }
 

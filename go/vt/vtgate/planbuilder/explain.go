@@ -29,17 +29,17 @@ import (
 )
 
 // Builds an explain-plan for the given Primitive
-func buildExplainPlan(stmt sqlparser.Explain, vschema ContextVSchema) (engine.Primitive, error) {
+func buildExplainPlan(stmt sqlparser.Explain, reservedVars *sqlparser.ReservedVars, vschema ContextVSchema, enableOnlineDDL, enableDirectDDL bool) (engine.Primitive, error) {
 	switch explain := stmt.(type) {
 	case *sqlparser.ExplainTab:
 		return explainTabPlan(explain, vschema)
 	case *sqlparser.ExplainStmt:
 		if explain.Type == sqlparser.VitessType {
-			return buildVitessTypePlan(explain, vschema)
+			return buildVitessTypePlan(explain, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
 		}
 		return buildOtherReadAndAdmin(sqlparser.String(explain), vschema)
 	}
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG unexpected explain type: %T", stmt)
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unexpected explain type: %T", stmt)
 }
 
 func explainTabPlan(explain *sqlparser.ExplainTab, vschema ContextVSchema) (engine.Primitive, error) {
@@ -61,8 +61,8 @@ func explainTabPlan(explain *sqlparser.ExplainTab, vschema ContextVSchema) (engi
 	}, nil
 }
 
-func buildVitessTypePlan(explain *sqlparser.ExplainStmt, vschema ContextVSchema) (engine.Primitive, error) {
-	innerInstruction, err := createInstructionFor(sqlparser.String(explain.Statement), explain.Statement, vschema)
+func buildVitessTypePlan(explain *sqlparser.ExplainStmt, reservedVars *sqlparser.ReservedVars, vschema ContextVSchema, enableOnlineDDL, enableDirectDDL bool) (engine.Primitive, error) {
+	innerInstruction, err := createInstructionFor(sqlparser.String(explain.Statement), explain.Statement, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
 	if err != nil {
 		return nil, err
 	}

@@ -17,9 +17,11 @@ limitations under the License.
 package planbuilder
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	"vitess.io/vitess/go/mysql"
@@ -54,9 +56,10 @@ func buildShowBasicPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engi
 	switch show.Command {
 	case sqlparser.Charset:
 		return buildCharsetPlan(show)
-	case sqlparser.Collation, sqlparser.Function, sqlparser.Privilege, sqlparser.Procedure,
-		sqlparser.VariableGlobal, sqlparser.VariableSession:
+	case sqlparser.Collation, sqlparser.Function, sqlparser.Privilege, sqlparser.Procedure:
 		return buildSendAnywherePlan(show, vschema)
+	case sqlparser.VariableGlobal, sqlparser.VariableSession:
+		return buildVariablePlan(show, vschema)
 	case sqlparser.Column, sqlparser.Index:
 		return buildShowTblPlan(show, vschema)
 	case sqlparser.Database, sqlparser.Keyspace:
@@ -65,8 +68,16 @@ func buildShowBasicPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engi
 		return buildPlanWithDB(show, vschema)
 	case sqlparser.StatusGlobal, sqlparser.StatusSession:
 		return engine.NewRowsPrimitive(make([][]sqltypes.Value, 0, 2), buildVarCharFields("Variable_name", "Value")), nil
+	case sqlparser.VitessMigrations:
+		return buildShowVMigrationsPlan(show, vschema)
+	case sqlparser.VGtidExecGlobal:
+		return buildShowVGtidPlan(show, vschema)
+	case sqlparser.GtidExecGlobal:
+		return buildShowGtidPlan(show, vschema)
+	case sqlparser.Warnings:
+		return buildWarnings()
 	}
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unknown show query type %s", show.Command.ToString())
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unknown show query type %s", show.Command.ToString())
 
 }
 
@@ -98,29 +109,52 @@ func buildSendAnywherePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (e
 	}, nil
 }
 
-func buildShowTblPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
-	if show.DbName != "" {
-		show.Tbl.Qualifier = sqlparser.NewTableIdent(show.DbName)
-	}
-	table, _, _, _, destination, err := vschema.FindTableOrVindex(show.Tbl)
+func buildVariablePlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+	plan, err := buildSendAnywherePlan(show, vschema)
 	if err != nil {
 		return nil, err
 	}
-	if table == nil {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "table does not exists: %s", show.Tbl.Name.String())
-	}
-	if destination == nil {
-		destination = key.DestinationAnyShard{}
+	plan = engine.NewReplaceVariables(plan)
+	return plan, nil
+}
+
+func buildShowTblPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+	if !show.DbName.IsEmpty() {
+		show.Tbl.Qualifier = sqlparser.NewTableIdent(show.DbName.String())
+		// Remove Database Name from the query.
+		show.DbName = sqlparser.NewTableIdent("")
 	}
 
-	// Remove Database Name from the query.
-	show.DbName = ""
-	show.Tbl.Qualifier = sqlparser.NewTableIdent("")
-	show.Tbl.Name = table.Name
+	dest := key.Destination(key.DestinationAnyShard{})
+	var ks *vindexes.Keyspace
+	var err error
+
+	if !show.Tbl.Qualifier.IsEmpty() && sqlparser.SystemSchema(show.Tbl.Qualifier.String()) {
+		ks, err = vschema.AnyKeyspace()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		table, _, _, _, destination, err := vschema.FindTableOrVindex(show.Tbl)
+		if err != nil {
+			return nil, err
+		}
+		if table == nil {
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.UnknownTable, "Table '%s' doesn't exist", show.Tbl.Name.String())
+		}
+		// Update the table.
+		show.Tbl.Qualifier = sqlparser.NewTableIdent("")
+		show.Tbl.Name = table.Name
+
+		if destination != nil {
+			dest = destination
+		}
+		ks = table.Keyspace
+	}
 
 	return &engine.Send{
-		Keyspace:          table.Keyspace,
-		TargetDestination: destination,
+		Keyspace:          ks,
+		TargetDestination: dest,
 		Query:             sqlparser.String(show),
 		IsDML:             false,
 		SingleShardOnly:   true,
@@ -148,10 +182,10 @@ func buildDBPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Prim
 
 	if show.Command == sqlparser.Database {
 		//Hard code default databases
-		rows = append(rows, buildVarCharRow("information_schema"))
-		rows = append(rows, buildVarCharRow("mysql"))
-		rows = append(rows, buildVarCharRow("sys"))
-		rows = append(rows, buildVarCharRow("performance_schema"))
+		ks = append(ks, &vindexes.Keyspace{Name: "information_schema"},
+			&vindexes.Keyspace{Name: "mysql"},
+			&vindexes.Keyspace{Name: "sys"},
+			&vindexes.Keyspace{Name: "performance_schema"})
 	}
 
 	for _, v := range ks {
@@ -162,19 +196,55 @@ func buildDBPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Prim
 	return engine.NewRowsPrimitive(rows, buildVarCharFields("Database")), nil
 }
 
+// buildShowVMigrationsPlan serves `SHOW VITESS_MIGRATIONS ...` queries. It invokes queries on _vt.schema_migrations on all MASTER tablets on keyspace's shards.
+func buildShowVMigrationsPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+	dest, ks, tabletType, err := vschema.TargetDestination(show.DbName.String())
+	if err != nil {
+		return nil, err
+	}
+	if ks == nil {
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.NoDB, "No database selected: use keyspace<:shard><@type> or keyspace<[range]><@type> (<> are optional)")
+	}
+
+	if tabletType != topodatapb.TabletType_MASTER {
+		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "show vitess_migrations works only on primary tablet")
+	}
+
+	if dest == nil {
+		dest = key.DestinationAllShards{}
+	}
+
+	sql := "SELECT * FROM _vt.schema_migrations"
+
+	if show.Filter != nil {
+		if show.Filter.Filter != nil {
+			sql += fmt.Sprintf(" where %s", sqlparser.String(show.Filter.Filter))
+		} else if show.Filter.Like != "" {
+			lit := sqlparser.String(sqlparser.NewStrLiteral(show.Filter.Like))
+			sql += fmt.Sprintf(" where migration_uuid LIKE %s OR migration_context LIKE %s OR migration_status LIKE %s", lit, lit, lit)
+		}
+	}
+	return &engine.Send{
+		Keyspace:          ks,
+		TargetDestination: dest,
+		Query:             sql,
+	}, nil
+}
+
 func buildPlanWithDB(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
 	dbName := show.DbName
-	if sqlparser.SystemSchema(dbName) {
+	dbDestination := show.DbName.String()
+	if sqlparser.SystemSchema(dbDestination) {
 		ks, err := vschema.AnyKeyspace()
 		if err != nil {
 			return nil, err
 		}
-		dbName = ks.Name
+		dbDestination = ks.Name
 	} else {
 		// Remove Database Name from the query.
-		show.DbName = ""
+		show.DbName = sqlparser.NewTableIdent("")
 	}
-	destination, keyspace, _, err := vschema.TargetDestination(dbName)
+	destination, keyspace, _, err := vschema.TargetDestination(dbDestination)
 	if err != nil {
 		return nil, err
 	}
@@ -182,14 +252,26 @@ func buildPlanWithDB(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.
 		destination = key.DestinationAnyShard{}
 	}
 
+	if dbName.IsEmpty() {
+		dbName = sqlparser.NewTableIdent(keyspace.Name)
+	}
+
 	query := sqlparser.String(show)
-	return &engine.Send{
+	var plan engine.Primitive
+	plan = &engine.Send{
 		Keyspace:          keyspace,
 		TargetDestination: destination,
 		Query:             query,
 		IsDML:             false,
 		SingleShardOnly:   true,
-	}, nil
+	}
+	if show.Command == sqlparser.Table {
+		plan, err = engine.NewRenameField([]string{"Tables_in_" + dbName.String()}, []int{0}, plan)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
 
 }
 
@@ -231,21 +313,21 @@ func generateCharsetRows(showFilter *sqlparser.ShowFilter, colNames []string) ([
 	} else {
 		cmpExp, ok := showFilter.Filter.(*sqlparser.ComparisonExpr)
 		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "expect a 'LIKE' or '=' expression")
+			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "expect a 'LIKE' or '=' expression")
 		}
 
 		left, ok := cmpExp.Left.(*sqlparser.ColName)
 		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "expect left side to be 'charset'")
+			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "expect left side to be 'charset'")
 		}
 		leftOk := left.Name.EqualString(charset)
 
 		if leftOk {
 			literal, ok := cmpExp.Right.(*sqlparser.Literal)
 			if !ok {
-				return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "we expect the right side to be a string")
+				return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "we expect the right side to be a string")
 			}
-			rightString := string(literal.Val)
+			rightString := literal.Val
 
 			switch cmpExp.Operator {
 			case sqlparser.EqualOp:
@@ -315,7 +397,7 @@ func buildShowCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (en
 	case sqlparser.CreateTbl:
 		return buildCreateTblPlan(show, vschema)
 	}
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unknown show query type %s", show.Command.ToString())
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unknown show query type %s", show.Command.ToString())
 }
 
 func buildCreateDbPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine.Primitive, error) {
@@ -362,7 +444,7 @@ func buildCreateTblPlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (eng
 			return nil, err
 		}
 		if tbl == nil {
-			return nil, vterrors.Errorf(vtrpcpb.Code_NOT_FOUND, "table now found: %v", show.Op)
+			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.UnknownTable, "Table '%s' doesn't exist", sqlparser.String(show.Op))
 		}
 		ks = tbl.Keyspace
 		if destKs != nil {
@@ -414,4 +496,72 @@ func buildCreatePlan(show *sqlparser.ShowCreate, vschema ContextVSchema) (engine
 		SingleShardOnly:   true,
 	}, nil
 
+}
+
+func buildShowVGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+	send, err := buildShowGtidPlan(show, vschema)
+	if err != nil {
+		return nil, err
+	}
+	return &engine.OrderedAggregate{
+		PreProcess: true,
+		Aggregates: []engine.AggregateParams{
+			{
+				Opcode: engine.AggregateGtid,
+				Col:    1,
+				Alias:  "global vgtid_executed",
+			},
+		},
+		TruncateColumnCount: 2,
+		Input:               send,
+	}, nil
+}
+
+func buildShowGtidPlan(show *sqlparser.ShowBasic, vschema ContextVSchema) (engine.Primitive, error) {
+	dbName := ""
+	if !show.DbName.IsEmpty() {
+		dbName = show.DbName.String()
+	}
+	dest, ks, _, err := vschema.TargetDestination(dbName)
+	if err != nil {
+		return nil, err
+	}
+	if dest == nil {
+		dest = key.DestinationAllShards{}
+	}
+
+	return &engine.Send{
+		Keyspace:          ks,
+		TargetDestination: dest,
+		Query:             fmt.Sprintf(`select '%s' as db_name, @@global.gtid_executed as gtid_executed, :%s as shard`, ks.Name, engine.ShardName),
+		ShardNameNeeded:   true,
+	}, nil
+}
+
+func buildWarnings() (engine.Primitive, error) {
+
+	f := func(sa engine.SessionActions) (*sqltypes.Result, error) {
+		fields := []*querypb.Field{
+			{Name: "Level", Type: sqltypes.VarChar},
+			{Name: "Code", Type: sqltypes.Uint16},
+			{Name: "Message", Type: sqltypes.VarChar},
+		}
+
+		warns := sa.GetWarnings()
+		rows := make([][]sqltypes.Value, 0, len(warns))
+
+		for _, warn := range warns {
+			rows = append(rows, []sqltypes.Value{
+				sqltypes.NewVarChar("Warning"),
+				sqltypes.NewUint32(warn.Code),
+				sqltypes.NewVarChar(warn.Message),
+			})
+		}
+		return &sqltypes.Result{
+			Fields: fields,
+			Rows:   rows,
+		}, nil
+	}
+
+	return engine.NewSessionPrimitive("SHOW WARNINGS", f), nil
 }

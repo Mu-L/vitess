@@ -22,10 +22,10 @@ option go_package = "vitess.io/vitess/go/vt/proto/vtctldata";
 
 package vtctldata;
 
-import "google/protobuf/duration.proto";
-
+import "binlogdata.proto";
 import "logutil.proto";
 import "mysqlctl.proto";
+import "replicationdata.proto";
 import "tabletmanagerdata.proto";
 import "topodata.proto";
 import "vschema.proto";
@@ -41,6 +41,121 @@ message ExecuteVtctlCommandRequest {
 // ExecuteVtctlCommandResponse is streamed back by ExecuteVtctlCommand.
 message ExecuteVtctlCommandResponse {
   logutil.Event event = 1;
+}
+
+// TableMaterializeSttings contains the settings for one table.
+message TableMaterializeSettings {
+  string target_table = 1;
+  // source_expression is a select statement.
+  string source_expression = 2;
+  // create_ddl contains the DDL to create the target table.
+  // If empty, the target table must already exist.
+  // if "copy", the target table DDL is the same as the source table.
+  string create_ddl = 3;
+}
+
+// MaterializeSettings contains the settings for the Materialize command.
+message MaterializeSettings {
+  // workflow is the name of the workflow.
+  string workflow = 1;
+  string source_keyspace = 2;
+  string target_keyspace = 3;
+  // stop_after_copy specifies if vreplication should be stopped after copying.
+  bool stop_after_copy = 4;
+  repeated TableMaterializeSettings table_settings = 5;
+  // optional parameters.
+  string cell = 6;
+  string tablet_types = 7;
+  // ExternalCluster is the name of the mounted cluster which has the source keyspace/db for this workflow
+  // it is of the type <cluster_type.cluster_name>
+  string external_cluster = 8;
+
+}
+
+/* Data types for VtctldServer */
+
+message Keyspace {
+  string name = 1;
+  topodata.Keyspace keyspace = 2;
+}
+
+message Shard {
+  string keyspace = 1;
+  string name = 2;
+  topodata.Shard shard = 3;
+}
+
+// TODO: comment the hell out of this.
+message Workflow {
+  string name = 1;
+  ReplicationLocation source = 2;
+  ReplicationLocation target = 3;
+  int64 max_v_replication_lag = 4;
+  map<string, ShardStream> shard_streams = 5;
+
+  message ReplicationLocation {
+    string keyspace = 1;
+    repeated string shards = 2;
+  }
+
+  message ShardStream {
+    repeated Stream streams = 1;
+    repeated topodata.Shard.TabletControl tablet_controls = 2;
+    bool is_primary_serving = 3;
+  }
+
+  message Stream {
+    int64 id = 1;
+    string shard = 2;
+    topodata.TabletAlias tablet = 3;
+    binlogdata.BinlogSource binlog_source = 4;
+    string position = 5;
+    string stop_position = 6;
+    string state = 7;
+    string db_name = 8;
+    vttime.Time transaction_timestamp = 9;
+    vttime.Time time_updated = 10;
+    string message = 11;
+    repeated CopyState copy_states = 12;
+
+    message CopyState {
+      string table = 1;
+      string last_pk = 2;
+    }
+  }
+}
+
+/* Request/response types for VtctldServer */
+
+message AddCellInfoRequest {
+  string name = 1;
+  topodata.CellInfo cell_info = 2;
+}
+
+message AddCellInfoResponse {
+}
+
+message AddCellsAliasRequest {
+  string name = 1;
+  repeated string cells = 2;
+}
+
+message AddCellsAliasResponse {
+}
+
+message ApplyRoutingRulesRequest {
+  vschema.RoutingRules routing_rules = 1;
+  // SkipRebuild, if set, will cause ApplyRoutingRules to skip rebuilding the
+  // SrvVSchema objects in each cell in RebuildCells.
+  bool skip_rebuild = 2;
+  // RebuildCells limits the SrvVSchema rebuild to the specified cells. If not
+  // provided the SrvVSchema will be rebuilt in every cell in the topology.
+  //
+  // Ignored if SkipRebuild is set.
+  repeated string rebuild_cells = 3;
+}
+
+message ApplyRoutingRulesResponse {
 }
 
 message ChangeTabletTypeRequest {
@@ -112,6 +227,21 @@ message CreateShardResponse {
   bool shard_already_exists = 3;
 }
 
+message DeleteCellInfoRequest {
+  string name = 1;
+  bool force = 2;
+}
+
+message DeleteCellInfoResponse {
+}
+
+message DeleteCellsAliasRequest {
+  string name = 1;
+}
+
+message DeleteCellsAliasResponse {
+}
+
 message DeleteKeyspaceRequest {
   // Keyspace is the name of the keyspace to delete.
   string keyspace = 1;
@@ -151,6 +281,45 @@ message DeleteTabletsRequest {
 message DeleteTabletsResponse {
 }
 
+message EmergencyReparentShardRequest {
+  // Keyspace is the name of the keyspace to perform the Emergency Reparent in.
+  string keyspace = 1;
+  // Shard is the name of the shard to perform the Emergency Reparent in.
+  string shard = 2;
+  // Optional alias of a tablet that should become the new shard primary. If not
+  // not specified, the vtctld will select the most up-to-date canditate to
+  // promote.
+  topodata.TabletAlias new_primary = 3;
+  // List of replica aliases to ignore during the Emergency Reparent. The vtctld
+  // will not attempt to stop replication on these tablets, nor attempt to
+  // demote any that may think they are the shard primary.
+  repeated topodata.TabletAlias ignore_replicas = 4;
+  // WaitReplicasTimeout is the duration of time to wait for replicas to catch
+  // up in reparenting.
+  vttime.Duration wait_replicas_timeout = 5;
+}
+
+message EmergencyReparentShardResponse {
+  // Keyspace is the name of the keyspace the Emergency Reparent took place in.
+  string keyspace = 1;
+  // Shard is the name of the shard the Emergency Reparent took place in.
+  string shard = 2;
+  // PromotedPrimary is the alias of the tablet that was promoted to shard
+  // primary. If NewPrimary was set in the request, then this will be the same
+  // alias. Otherwise, it will be the alias of the tablet found to be most
+  // up-to-date.
+  topodata.TabletAlias promoted_primary = 3;
+  repeated logutil.Event events = 4;
+}
+
+message FindAllShardsInKeyspaceRequest {
+  string keyspace = 1;
+}
+
+message FindAllShardsInKeyspaceResponse {
+  map<string, Shard> shards = 1;
+}
+
 message GetBackupsRequest {
   string keyspace = 1;
   string shard = 2;
@@ -160,19 +329,19 @@ message GetBackupsResponse {
   repeated mysqlctl.BackupInfo backups = 1;
 }
 
-message GetCellInfoNamesRequest {
-}
-
-message GetCellInfoNamesResponse {
-  repeated string names = 1;
-}
-
 message GetCellInfoRequest {
   string cell = 1;
 }
 
 message GetCellInfoResponse {
   topodata.CellInfo cell_info = 1;
+}
+
+message GetCellInfoNamesRequest {
+}
+
+message GetCellInfoNamesResponse {
+  repeated string names = 1;
 }
 
 message GetCellsAliasesRequest {
@@ -186,7 +355,7 @@ message GetKeyspacesRequest {
 }
 
 message GetKeyspacesResponse {
-  repeated Keyspace keyspaces = 1; 
+  repeated Keyspace keyspaces = 1;
 }
 
 message GetKeyspaceRequest {
@@ -195,6 +364,13 @@ message GetKeyspaceRequest {
 
 message GetKeyspaceResponse {
   Keyspace keyspace = 1;
+}
+
+message GetRoutingRulesRequest {
+}
+
+message GetRoutingRulesResponse {
+  vschema.RoutingRules routing_rules = 1;
 }
 
 message GetSchemaRequest {
@@ -229,12 +405,33 @@ message GetShardResponse {
   Shard shard = 1;
 }
 
+message GetSrvKeyspacesRequest {
+  string keyspace = 1;
+  // Cells is a list of cells to lookup a SrvKeyspace for. Leaving this empty is
+  // equivalent to specifying all cells in the topo.
+  repeated string cells = 2;
+}
+
+message GetSrvKeyspacesResponse {
+  // SrvKeyspaces is a mapping of cell name to SrvKeyspace.
+  map<string, topodata.SrvKeyspace> srv_keyspaces = 1;
+}
+
 message GetSrvVSchemaRequest {
   string cell = 1;
 }
 
 message GetSrvVSchemaResponse {
   vschema.SrvVSchema srv_v_schema = 1;
+}
+
+message GetSrvVSchemasRequest {
+  repeated string cells = 2;
+}
+
+message GetSrvVSchemasResponse {  
+  // SrvVSchemas is a mapping of cell name to SrvVSchema
+  map<string, vschema.SrvVSchema> srv_v_schemas = 1;
 }
 
 message GetTabletRequest {
@@ -254,6 +451,17 @@ message GetTabletsRequest {
   string shard = 2;
   // Cells is an optional set of cells to return tablets for.
   repeated string cells = 3;
+  // Strict specifies how the server should treat failures from individual
+  // cells.
+  //
+  // When false (the default), GetTablets will return data from any cells that
+  // return successfully, but will fail the request if all cells fail. When
+  // true, any individual cell can fail the full request.
+  bool strict = 4;
+  // TabletAliases is an optional list of tablet aliases to fetch Tablet objects
+  // for. If specified, Keyspace, Shard, and Cells are ignored, and tablets are
+  // looked up by their respective aliases' Cells directly.
+  repeated topodata.TabletAlias tablet_aliases = 5;
 }
 
 message GetTabletsResponse {
@@ -268,16 +476,72 @@ message GetVSchemaResponse {
   vschema.Keyspace v_schema = 1;
 }
 
+message GetWorkflowsRequest {
+  string keyspace = 1;
+  bool active_only = 2;
+}
+
+message GetWorkflowsResponse {
+  repeated Workflow workflows = 1;
+}
+
 message InitShardPrimaryRequest {
   string keyspace = 1;
   string shard = 2;
   topodata.TabletAlias primary_elect_tablet_alias = 3;
   bool force = 4;
-  google.protobuf.Duration wait_replicas_timeout = 5;
+  vttime.Duration wait_replicas_timeout = 5;
 }
 
 message InitShardPrimaryResponse {
   repeated logutil.Event events = 1;
+}
+
+message PlannedReparentShardRequest {
+  // Keyspace is the name of the keyspace to perform the Planned Reparent in.
+  string keyspace = 1;
+  // Shard is the name of the shard to perform teh Planned Reparent in.
+  string shard = 2;
+  // NewPrimary is the alias of the tablet to promote to shard primary. If not
+  // specified, the vtctld will select the most up-to-date candidate to promote.
+  //
+  // It is an error to set NewPrimary and AvoidPrimary to the same alias.
+  topodata.TabletAlias new_primary = 3;
+  // AvoidPrimary is the alias of the tablet to demote. In other words,
+  // specifying an AvoidPrimary alias tells the vtctld to promote any replica
+  // other than this one. A shard whose current primary is not this one is then
+  // a no-op.
+  //
+  // It is an error to set NewPrimary and AvoidPrimary to the same alias.
+  topodata.TabletAlias avoid_primary = 4;
+  // WaitReplicasTimeout is the duration of time to wait for replicas to catch
+  // up in replication both before and after the reparent. The timeout is not
+  // cumulative across both wait periods, meaning that the replicas have
+  // WaitReplicasTimeout time to catch up before the reparent, and an additional
+  // WaitReplicasTimeout time to catch up after the reparent.
+  vttime.Duration wait_replicas_timeout = 5;
+}
+
+message PlannedReparentShardResponse {
+  // Keyspace is the name of the keyspace the Planned Reparent took place in.
+  string keyspace = 1;
+  // Shard is the name of the shard the Planned Reparent took place in.
+  string shard = 2;
+  // PromotedPrimary is the alias of the tablet that was promoted to shard
+  // primary. If NewPrimary was set in the request, then this will be the same
+  // alias. Otherwise, it will be the alias of the tablet found to be most
+  // up-to-date.
+  topodata.TabletAlias promoted_primary = 3;
+  repeated logutil.Event events = 4;
+}
+
+message RebuildVSchemaGraphRequest {
+  // Cells specifies the cells to rebuild the SrvVSchema objects for. If empty,
+  // RebuildVSchemaGraph rebuilds the SrvVSchema for every cell in the topo.
+  repeated string cells = 1;
+}
+
+message RebuildVSchemaGraphResponse {
 }
 
 message RemoveKeyspaceCellRequest {
@@ -315,46 +579,64 @@ message RemoveShardCellResponse {
   // and any deleted Tablet objects here.
 }
 
-message Keyspace {
+message ReparentTabletRequest {
+  // Tablet is the alias of the tablet that should be reparented under the
+  // current shard primary.
+  topodata.TabletAlias tablet = 1;
+}
+
+message ReparentTabletResponse {
+  // Keyspace is the name of the keyspace the tablet was reparented in.
+  string keyspace = 1;
+  // Shard is the name of the shard the tablet was reparented in.
+  string shard = 2;
+  // Primary is the alias of the tablet that the tablet was reparented under.
+  topodata.TabletAlias primary = 3;
+}
+
+message ShardReplicationPositionsRequest {
+  string keyspace = 1;
+  string shard = 2;
+}
+
+message ShardReplicationPositionsResponse {
+  // ReplicationStatuses is a mapping of tablet alias string to replication
+  // status for that tablet.
+  map<string, replicationdata.Status> replication_statuses = 1;
+  // TabletMap is the set of tablets whose replication statuses were queried,
+  // keyed by tablet alias.
+  map<string, topodata.Tablet> tablet_map = 2;
+}
+
+message TabletExternallyReparentedRequest {
+  // Tablet is the alias of the tablet that was promoted externally and should
+  // be updated to the shard primary in the topo.
+  topodata.TabletAlias tablet = 1;
+}
+
+message TabletExternallyReparentedResponse {
+  string keyspace = 1;
+  string shard = 2;
+  topodata.TabletAlias new_primary = 3;
+  topodata.TabletAlias old_primary = 4;
+}
+
+message UpdateCellInfoRequest {
   string name = 1;
-  topodata.Keyspace keyspace = 2;
+  topodata.CellInfo cell_info = 2;
 }
 
-message FindAllShardsInKeyspaceRequest {
-  string keyspace = 1;
+message UpdateCellInfoResponse {
+  string name = 1;
+  topodata.CellInfo cell_info = 2;
 }
 
-message FindAllShardsInKeyspaceResponse {
-  map<string, Shard> shards = 1;
+message UpdateCellsAliasRequest {
+  string name = 1;
+  topodata.CellsAlias cells_alias = 2;
 }
 
-message Shard {
-  string keyspace = 1;
-  string name = 2;
-  topodata.Shard shard = 3;
-}
-
-// TableMaterializeSttings contains the settings for one table.
-message TableMaterializeSettings {
-  string target_table = 1;
-  // source_expression is a select statement.
-  string source_expression = 2;
-  // create_ddl contains the DDL to create the target table.
-  // If empty, the target table must already exist.
-  // if "copy", the target table DDL is the same as the source table.
-  string create_ddl = 3;
-}
-
-// MaterializeSettings contains the settings for the Materialize command.
-message MaterializeSettings {
-  // workflow is the name of the workflow.
-  string workflow = 1;
-  string source_keyspace = 2;
-  string target_keyspace = 3;
-  // stop_after_copy specifies if vreplication should be stopped after copying.
-  bool stop_after_copy = 4;
-  repeated TableMaterializeSettings table_settings = 5;
-  // optional parameters.
-  string cell = 6;
-  string tablet_types = 7;
+message UpdateCellsAliasResponse {
+  string name = 1;
+  topodata.CellsAlias cells_alias = 2;
 }

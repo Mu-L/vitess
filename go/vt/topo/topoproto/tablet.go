@@ -21,11 +21,13 @@ package topoproto
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"vitess.io/vitess/go/netutil"
@@ -74,19 +76,23 @@ func TabletAliasUIDStr(ta *topodatapb.TabletAlias) string {
 	return fmt.Sprintf("%010d", ta.Uid)
 }
 
+const tabletAliasFormat = "^(?P<cell>[-_.a-zA-Z0-9]+)-(?P<uid>[0-9]+)$"
+
+var tabletAliasRegexp = regexp.MustCompile(tabletAliasFormat)
+
 // ParseTabletAlias returns a TabletAlias for the input string,
 // of the form <cell>-<uid>
 func ParseTabletAlias(aliasStr string) (*topodatapb.TabletAlias, error) {
-	nameParts := strings.Split(aliasStr, "-")
-	if len(nameParts) != 2 {
-		return nil, fmt.Errorf("invalid tablet alias: '%s', expecting format: '<cell>-<uid>'", aliasStr)
+	nameParts := tabletAliasRegexp.FindStringSubmatch(aliasStr)
+	if len(nameParts) != 3 {
+		return nil, fmt.Errorf("invalid tablet alias: '%s', expecting format: '%s'", aliasStr, tabletAliasFormat)
 	}
-	uid, err := ParseUID(nameParts[1])
+	uid, err := ParseUID(nameParts[tabletAliasRegexp.SubexpIndex("uid")])
 	if err != nil {
 		return nil, vterrors.Wrapf(err, "invalid tablet uid in alias '%s'", aliasStr)
 	}
 	return &topodatapb.TabletAlias{
-		Cell: nameParts[0],
+		Cell: nameParts[tabletAliasRegexp.SubexpIndex("cell")],
 		Uid:  uid,
 	}, nil
 }
@@ -132,6 +138,18 @@ func (tal TabletAliasList) Less(i, j int) bool {
 // Swap is part of sort.Interface
 func (tal TabletAliasList) Swap(i, j int) {
 	tal[i], tal[j] = tal[j], tal[i]
+}
+
+// ToStringSlice returns a slice which is the result of mapping
+// TabletAliasString over a slice of TabletAliases.
+func (tal TabletAliasList) ToStringSlice() []string {
+	result := make([]string, len(tal))
+
+	for i, alias := range tal {
+		result[i] = TabletAliasString(alias)
+	}
+
+	return result
 }
 
 // AllTabletTypes lists all the possible tablet types

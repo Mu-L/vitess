@@ -191,6 +191,7 @@ func TestPlan(t *testing.T) {
 	testFile(t, "ddl_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper, false)
 	testFile(t, "flush_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper, false)
 	testFile(t, "show_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "stream_cases.txt", testOutputTempDir, vschemaWrapper, false)
 }
 
 func TestSysVarSetDisabled(t *testing.T) {
@@ -246,9 +247,24 @@ func TestWithDefaultKeyspaceFromFile(t *testing.T) {
 
 	testFile(t, "alterVschema_cases.txt", testOutputTempDir, vschema, false)
 	testFile(t, "ddl_cases.txt", testOutputTempDir, vschema, false)
+	testFile(t, "migration_cases.txt", testOutputTempDir, vschema, false)
 	testFile(t, "flush_cases.txt", testOutputTempDir, vschema, false)
 	testFile(t, "show_cases.txt", testOutputTempDir, vschema, false)
 	testFile(t, "call_cases.txt", testOutputTempDir, vschema, false)
+}
+
+func TestWithSystemSchemaAsDefaultKeyspace(t *testing.T) {
+	// We are testing this separately so we can set a default keyspace
+	testOutputTempDir, err := ioutil.TempDir("", "plan_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(testOutputTempDir)
+	vschema := &vschemaWrapper{
+		v:          loadSchema(t, "schema_test.json"),
+		keyspace:   &vindexes.Keyspace{Name: "mysql"},
+		tabletType: topodatapb.TabletType_MASTER,
+	}
+
+	testFile(t, "sysschema_default.txt", testOutputTempDir, vschema, false)
 }
 
 func TestOtherPlanningFromFile(t *testing.T) {
@@ -297,6 +313,10 @@ type vschemaWrapper struct {
 	version       PlannerVersion
 }
 
+func (vw *vschemaWrapper) ForeignKeyMode() string {
+	return "allow"
+}
+
 func (vw *vschemaWrapper) AllKeyspace() ([]*vindexes.Keyspace, error) {
 	if vw.keyspace == nil {
 		return nil, errors.New("keyspace not available")
@@ -335,7 +355,7 @@ func (vw *vschemaWrapper) TargetDestination(qualifier string) (key.Destination, 
 	}
 	keyspace := vw.v.Keyspaces[keyspaceName]
 	if keyspace == nil {
-		return nil, nil, 0, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "no keyspace with name [%s] found", keyspaceName)
+		return nil, nil, 0, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", keyspaceName)
 	}
 	return vw.dest, keyspace.Keyspace, vw.tabletType, nil
 
@@ -366,14 +386,28 @@ func (vw *vschemaWrapper) FindTableOrVindex(tab sqlparser.TableName) (*vindexes.
 	if err != nil {
 		return nil, nil, destKeyspace, destTabletType, destTarget, err
 	}
-	if destKeyspace == "" && vw.keyspace != nil {
-		destKeyspace = vw.keyspace.Name
+	if destKeyspace == "" {
+		destKeyspace = vw.getActualKeyspace()
 	}
 	table, vindex, err := vw.v.FindTableOrVindex(destKeyspace, tab.Name.String(), topodatapb.TabletType_MASTER)
 	if err != nil {
 		return nil, nil, destKeyspace, destTabletType, destTarget, err
 	}
 	return table, vindex, destKeyspace, destTabletType, destTarget, nil
+}
+
+func (vw *vschemaWrapper) getActualKeyspace() string {
+	if vw.keyspace == nil {
+		return ""
+	}
+	if !sqlparser.SystemSchema(vw.keyspace.Name) {
+		return vw.keyspace.Name
+	}
+	ks, err := vw.AnyKeyspace()
+	if err != nil {
+		return ""
+	}
+	return ks.Name
 }
 
 func (vw *vschemaWrapper) DefaultKeyspace() (*vindexes.Keyspace, error) {
@@ -392,6 +426,17 @@ func (vw *vschemaWrapper) TargetString() string {
 	return "targetString"
 }
 
+func (vw *vschemaWrapper) WarnUnshardedOnly(_ string, _ ...interface{}) {
+
+}
+
+func (vw *vschemaWrapper) ErrorIfShardedF(keyspace *vindexes.Keyspace, _, errFmt string, params ...interface{}) error {
+	if keyspace.Sharded {
+		return fmt.Errorf(errFmt, params...)
+	}
+	return nil
+}
+
 func escapeNewLines(in string) string {
 	return strings.ReplaceAll(in, "\n", "\\n")
 }
@@ -401,6 +446,7 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, c
 	t.Run(filename, func(t *testing.T) {
 		expected := &strings.Builder{}
 		fail := checkAllTests
+		var outFirstPlanner string
 		for tcase := range iterateExecFile(filename) {
 			t.Run(fmt.Sprintf("%d V3: %s", tcase.lineno, tcase.comments), func(t *testing.T) {
 				vschema.version = V3
@@ -414,6 +460,7 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, c
 				if err != nil {
 					out = `"` + out + `"`
 				}
+				outFirstPlanner = out
 
 				expected.WriteString(fmt.Sprintf("%s\"%s\"\n%s\n", tcase.comments, escapeNewLines(tcase.input), out))
 			})
@@ -433,8 +480,9 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, c
 			//       this is shown by not having any info at all after the result for the V3 planner
 			//       with this last expectation, it is an error if the V4 planner
 			//       produces the same plan as the V3 planner does
+			testName := fmt.Sprintf("%d V4: %s", tcase.lineno, tcase.comments)
 			if !empty || checkAllTests {
-				t.Run(fmt.Sprintf("%d V4: %s", tcase.lineno, tcase.comments), func(t *testing.T) {
+				t.Run(testName, func(t *testing.T) {
 					if out != tcase.output2ndPlanner {
 						fail = true
 						t.Errorf("V4 - %s:%d\nDiff:\n%s\n[%s] \n[%s]", filename, tcase.lineno, cmp.Diff(tcase.output2ndPlanner, out), tcase.output, out)
@@ -444,7 +492,7 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, c
 						out = `"` + out + `"`
 					}
 
-					if tcase.output == out {
+					if outFirstPlanner == out {
 						expected.WriteString(samePlanMarker)
 					} else {
 						expected.WriteString(fmt.Sprintf("%s\n", out))
@@ -452,7 +500,7 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, c
 				})
 			} else {
 				if out == tcase.output && checkV4equalPlan {
-					t.Run("V4: "+tcase.comments, func(t *testing.T) {
+					t.Run(testName, func(t *testing.T) {
 						t.Errorf("V4 - %s:%d\nplanner produces same output as V3", filename, tcase.lineno)
 					})
 				}
@@ -597,7 +645,7 @@ func locateFile(name string) string {
 }
 
 func BenchmarkPlanner(b *testing.B) {
-	filenames := []string{"from_cases.txt", "filter_cases.txt", "large_cases.txt", "aggr_cases.txt", "memory_sort_cases.txt", "select_cases.txt", "union_cases.txt", "wireup_cases.txt"}
+	filenames := []string{"from_cases.txt", "filter_cases.txt", "large_cases.txt", "aggr_cases.txt", "select_cases.txt", "union_cases.txt"}
 	vschema := &vschemaWrapper{
 		v:             loadSchema(b, "schema_test.json"),
 		sysVarEnabled: true,

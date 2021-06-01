@@ -21,7 +21,9 @@ package sandboxconn
 import (
 	"fmt"
 	"sync"
+	"time"
 
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	"context"
@@ -96,6 +98,7 @@ type SandboxConn struct {
 	StartPos      string
 	VStreamEvents [][]*binlogdatapb.VEvent
 	VStreamErrors []error
+	VStreamCh     chan *binlogdatapb.VEvent
 
 	// transaction id generator
 	TransactionID sync2.AtomicInt64
@@ -111,6 +114,8 @@ type SandboxConn struct {
 
 	// this error will only happen once
 	EphemeralShardErr error
+
+	NotServing bool
 }
 
 var _ queryservice.QueryService = (*SandboxConn)(nil) // compile-time interface check
@@ -150,6 +155,12 @@ func (sbc *SandboxConn) Execute(ctx context.Context, target *querypb.Target, que
 	sbc.execMu.Lock()
 	defer sbc.execMu.Unlock()
 	sbc.ExecCount.Add(1)
+	if sbc.NotServing {
+		return nil, vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.NotServing)
+	}
+	if sbc.tablet.Type != target.TabletType {
+		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "%s: %v, want: %v", vterrors.WrongTablet, target.TabletType, sbc.tablet.Type)
+	}
 	bv := make(map[string]*querypb.BindVariable)
 	for k, v := range bindVars {
 		bv[k] = v
@@ -204,10 +215,25 @@ func (sbc *SandboxConn) StreamExecute(ctx context.Context, target *querypb.Targe
 		return err
 	}
 	parse, _ := sqlparser.Parse(query)
-	nextRs := sbc.getNextResult(parse)
-	sbc.sExecMu.Unlock()
 
-	return callback(nextRs)
+	if sbc.results == nil {
+		nextRs := sbc.getNextResult(parse)
+		sbc.sExecMu.Unlock()
+		return callback(nextRs)
+	}
+
+	for len(sbc.results) > 0 {
+		nextRs := sbc.getNextResult(parse)
+		sbc.sExecMu.Unlock()
+		err := callback(nextRs)
+		if err != nil {
+			return err
+		}
+		sbc.sExecMu.Lock()
+	}
+
+	sbc.sExecMu.Unlock()
+	return nil
 }
 
 // Begin is part of the QueryService interface.
@@ -406,18 +432,60 @@ func (sbc *SandboxConn) AddVStreamEvents(events []*binlogdatapb.VEvent, err erro
 // VStream is part of the QueryService interface.
 func (sbc *SandboxConn) VStream(ctx context.Context, target *querypb.Target, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
 	if sbc.StartPos != "" && sbc.StartPos != startPos {
+		log.Errorf("startPos(%v): %v, want %v", target, startPos, sbc.StartPos)
 		return fmt.Errorf("startPos(%v): %v, want %v", target, startPos, sbc.StartPos)
 	}
-	for len(sbc.VStreamEvents) != 0 {
-		ev := sbc.VStreamEvents[0]
-		err := sbc.VStreamErrors[0]
-		sbc.VStreamEvents = sbc.VStreamEvents[1:]
-		sbc.VStreamErrors = sbc.VStreamErrors[1:]
-		if ev == nil {
-			return err
+	done := false
+	// for testing the minimize stream skew feature (TestStreamSkew) we need the ability to send events in specific sequences from
+	// multiple streams. We introduce a channel in the sandbox that we listen on and vstream those events
+	// as we receive them. We also need to simulate vstreamer heartbeats since the skew detection logic depends on it
+	// in case of shards where there are no real events within a second
+	if sbc.VStreamCh != nil {
+		lastTimestamp := int64(0)
+		for !done {
+			timer := time.NewTimer(1 * time.Second)
+			select {
+			case <-timer.C:
+				events := []*binlogdatapb.VEvent{{
+					Type:        binlogdatapb.VEventType_HEARTBEAT,
+					Timestamp:   lastTimestamp,
+					CurrentTime: lastTimestamp,
+				}, {
+					Type:        binlogdatapb.VEventType_COMMIT,
+					Timestamp:   lastTimestamp,
+					CurrentTime: lastTimestamp,
+				}}
+
+				if err := send(events); err != nil {
+					log.Infof("error sending event in test sandbox %s", err.Error())
+					return err
+				}
+				lastTimestamp++
+
+			case ev := <-sbc.VStreamCh:
+				if ev == nil {
+					done = true
+				}
+				if err := send([]*binlogdatapb.VEvent{ev}); err != nil {
+					log.Infof("error sending event in test sandbox %s", err.Error())
+					return err
+				}
+				lastTimestamp = ev.Timestamp
+			}
 		}
-		if err := send(ev); err != nil {
-			return err
+	} else {
+		// this path is followed for all vstream tests other than the skew tests
+		for len(sbc.VStreamEvents) != 0 {
+			ev := sbc.VStreamEvents[0]
+			err := sbc.VStreamErrors[0]
+			sbc.VStreamEvents = sbc.VStreamEvents[1:]
+			sbc.VStreamErrors = sbc.VStreamErrors[1:]
+			if ev == nil {
+				return err
+			}
+			if err := send(ev); err != nil {
+				return err
+			}
 		}
 	}
 	// Don't return till context is canceled.
@@ -436,7 +504,7 @@ func (sbc *SandboxConn) VStreamResults(ctx context.Context, target *querypb.Targ
 }
 
 // QueryServiceByAlias is part of the Gateway interface.
-func (sbc *SandboxConn) QueryServiceByAlias(_ *topodatapb.TabletAlias) (queryservice.QueryService, error) {
+func (sbc *SandboxConn) QueryServiceByAlias(_ *topodatapb.TabletAlias, _ *querypb.Target) (queryservice.QueryService, error) {
 	return sbc, nil
 }
 
@@ -447,7 +515,7 @@ func (sbc *SandboxConn) HandlePanic(err *error) {
 //ReserveBeginExecute implements the QueryService interface
 func (sbc *SandboxConn) ReserveBeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, int64, *topodatapb.TabletAlias, error) {
 	reservedID := sbc.reserve(ctx, target, preQueries, bindVariables, 0, options)
-	result, transactionID, alias, err := sbc.BeginExecute(ctx, target, preQueries, sql, bindVariables, reservedID, options)
+	result, transactionID, alias, err := sbc.BeginExecute(ctx, target, nil, sql, bindVariables, reservedID, options)
 	if transactionID != 0 {
 		sbc.setTxReservedID(transactionID, reservedID)
 	}
@@ -497,6 +565,11 @@ func (sbc *SandboxConn) Tablet() *topodatapb.Tablet {
 	return sbc.tablet
 }
 
+// ChangeTabletType changes the tablet type.
+func (sbc *SandboxConn) ChangeTabletType(typ topodatapb.TabletType) {
+	sbc.tablet.Type = typ
+}
+
 func (sbc *SandboxConn) getNextResult(stmt sqlparser.Statement) *sqltypes.Result {
 	if len(sbc.results) != 0 {
 		r := sbc.results[0]
@@ -505,7 +578,7 @@ func (sbc *SandboxConn) getNextResult(stmt sqlparser.Statement) *sqltypes.Result
 	}
 	if stmt == nil {
 		// if we didn't get a valid query, we'll assume we need a SELECT
-		return SingleRowResult
+		return getSingleRowResult()
 	}
 	switch stmt.(type) {
 	case *sqlparser.Select,
@@ -513,7 +586,7 @@ func (sbc *SandboxConn) getNextResult(stmt sqlparser.Statement) *sqltypes.Result
 		*sqlparser.Show,
 		sqlparser.Explain,
 		*sqlparser.OtherRead:
-		return SingleRowResult
+		return getSingleRowResult()
 	case *sqlparser.Set,
 		sqlparser.DDLStatement,
 		*sqlparser.AlterVschema,
@@ -549,6 +622,25 @@ func (sbc *SandboxConn) StringQueries() []string {
 		result[i] = query.Sql
 	}
 	return result
+}
+
+// getSingleRowResult is used to get a SingleRowResult but it creates separate fields because some tests change the fields
+// If these fields are not created separately then the constants value also changes which leads to some other tests failing later
+func getSingleRowResult() *sqltypes.Result {
+	singleRowResult := &sqltypes.Result{
+		InsertID:    SingleRowResult.InsertID,
+		StatusFlags: SingleRowResult.StatusFlags,
+		Rows:        SingleRowResult.Rows,
+	}
+
+	for _, field := range SingleRowResult.Fields {
+		singleRowResult.Fields = append(singleRowResult.Fields, &querypb.Field{
+			Name: field.Name,
+			Type: field.Type,
+		})
+	}
+
+	return singleRowResult
 }
 
 // SingleRowResult is returned when there is no pre-stored result.

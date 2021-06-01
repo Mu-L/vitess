@@ -27,6 +27,8 @@ import (
 	"sort"
 	"strings"
 
+	"vitess.io/vitess/go/tools/common"
+
 	"github.com/dave/jennifer/jen"
 	"golang.org/x/tools/go/packages"
 )
@@ -168,14 +170,6 @@ func findImplementations(scope *types.Scope, iff *types.Interface, impl func(typ
 			impl(baseType)
 		}
 	}
-}
-
-func (sizegen *sizegen) generateKnownInterface(pkg *types.Package, iff *types.Interface) {
-	findImplementations(pkg.Scope(), iff, func(tt types.Type) {
-		if named, ok := tt.(*types.Named); ok {
-			sizegen.generateKnownType(named)
-		}
-	})
 }
 
 func (sizegen *sizegen) finalize() map[string]*jen.File {
@@ -509,11 +503,14 @@ func VerifyFilesOnDisk(result map[string]*jen.File) (errors []error) {
 func GenerateSizeHelpers(packagePatterns []string, typePatterns []string) (map[string]*jen.File, error) {
 	loaded, err := packages.Load(&packages.Config{
 		Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesSizes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports | packages.NeedModule,
-		Logf: log.Printf,
 	}, packagePatterns...)
 
 	if err != nil {
 		return nil, err
+	}
+
+	if common.PkgFailed(loaded) {
+		return nil, fmt.Errorf("failed to load packages")
 	}
 
 	sizegen := newSizegen(loaded[0].Module, loaded[0].TypesSizes)

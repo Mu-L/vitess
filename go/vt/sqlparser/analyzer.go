@@ -61,6 +61,7 @@ const (
 	StmtUnlockTables
 	StmtFlush
 	StmtCallProc
+	StmtRevert
 )
 
 //ASTToStatementType returns a StatementType from an AST stmt
@@ -80,6 +81,8 @@ func ASTToStatementType(stmt Statement) StatementType {
 		return StmtShow
 	case DDLStatement, DBDDLStatement, *AlterVschema:
 		return StmtDDL
+	case *RevertMigration:
+		return StmtRevert
 	case *Use:
 		return StmtUse
 	case *OtherRead, *OtherAdmin, *Load:
@@ -106,6 +109,10 @@ func ASTToStatementType(stmt Statement) StatementType {
 		return StmtFlush
 	case *CallProc:
 		return StmtCallProc
+	case *Stream:
+		return StmtStream
+	case *VStream:
+		return StmtVStream
 	default:
 		return StmtUnknown
 	}
@@ -114,7 +121,7 @@ func ASTToStatementType(stmt Statement) StatementType {
 //CanNormalize takes Statement and returns if the statement can be normalized.
 func CanNormalize(stmt Statement) bool {
 	switch stmt.(type) {
-	case *Select, *Union, *Insert, *Update, *Delete, *Set, *CallProc: // TODO: we could merge this logic into ASTrewriter
+	case *Select, *Union, *Insert, *Update, *Delete, *Set, *CallProc, *Stream: // TODO: we could merge this logic into ASTrewriter
 		return true
 	}
 	return false
@@ -124,17 +131,23 @@ func CanNormalize(stmt Statement) bool {
 func CachePlan(stmt Statement) bool {
 	switch stmt.(type) {
 	case *Select, *Union, *ParenSelect,
-		*Insert, *Update, *Delete:
+		*Insert, *Update, *Delete, *Stream:
 		return true
 	}
 	return false
 }
 
-//IsSetStatement takes Statement and returns if the statement is set statement.
-func IsSetStatement(stmt Statement) bool {
-	switch stmt.(type) {
+//MustRewriteAST takes Statement and returns true if RewriteAST must run on it for correct execution irrespective of user flags.
+func MustRewriteAST(stmt Statement) bool {
+	switch node := stmt.(type) {
 	case *Set:
 		return true
+	case *Show:
+		switch node.Internal.(type) {
+		case *ShowBasic:
+			return true
+		}
+		return false
 	}
 	return false
 }
@@ -163,6 +176,8 @@ func Preview(sql string) StatementType {
 		return StmtStream
 	case "vstream":
 		return StmtVStream
+	case "revert":
+		return StmtRevert
 	case "insert":
 		return StmtInsert
 	case "replace":
@@ -225,6 +240,8 @@ func (s StatementType) String() string {
 		return "STREAM"
 	case StmtVStream:
 		return "VSTREAM"
+	case StmtRevert:
+		return "REVERT"
 	case StmtInsert:
 		return "INSERT"
 	case StmtReplace:
@@ -393,7 +410,7 @@ func IsSimpleTuple(node Expr) bool {
 func NewPlanValue(node Expr) (sqltypes.PlanValue, error) {
 	switch node := node.(type) {
 	case Argument:
-		return sqltypes.PlanValue{Key: string(node[1:])}, nil
+		return sqltypes.PlanValue{Key: string(node)}, nil
 	case *Literal:
 		switch node.Type {
 		case IntVal:
@@ -403,9 +420,9 @@ func NewPlanValue(node Expr) (sqltypes.PlanValue, error) {
 			}
 			return sqltypes.PlanValue{Value: n}, nil
 		case FloatVal:
-			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.Float64, node.Val)}, nil
+			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.Float64, node.Bytes())}, nil
 		case StrVal:
-			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.VarBinary, node.Val)}, nil
+			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.VarBinary, node.Bytes())}, nil
 		case HexVal:
 			v, err := node.HexDecode()
 			if err != nil {
@@ -414,7 +431,7 @@ func NewPlanValue(node Expr) (sqltypes.PlanValue, error) {
 			return sqltypes.PlanValue{Value: sqltypes.MakeTrusted(sqltypes.VarBinary, v)}, nil
 		}
 	case ListArg:
-		return sqltypes.PlanValue{ListKey: string(node[2:])}, nil
+		return sqltypes.PlanValue{ListKey: string(node)}, nil
 	case ValTuple:
 		pv := sqltypes.PlanValue{
 			Values: make([]sqltypes.PlanValue, 0, len(node)),
